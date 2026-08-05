@@ -17,12 +17,24 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Bell, Building2, Loader2, RotateCw, Search } from 'lucide-react'
+import { Bell, Building2, Loader2, RotateCw, Search, UserPlus } from 'lucide-react'
 import { api, send } from './lib/api'
 import type { BusinessProfile, McpRow, MemberRow, NotificationRow, PushResult, TeamRow } from './lib/api'
 import { Badge, Card, Empty, ErrorBox, Field, Spinner, Table, Td, cx, inputCls } from './ui'
 
 type Person = MemberRow & { team_id: number; team_name: string }
+
+/** POST /auth/register's user object. `invite_code` is present ONLY on the team_lead
+ *  branch — it is the single moment the backend ever discloses one. */
+type RegisteredUser = {
+  id: number; name: string; email: string; account_type: string
+  team_id?: number | null; team_name?: string | null
+  invite_code?: string | null; onboarding_state?: string
+}
+
+// Kept beside the admin secret, in the browser — never in the repo.
+const LS_PLATFORM_CODE = 'oscar.admin.platformInviteCode'
+const LS_SUPER_ADMIN = 'oscar.admin.superAdminCode'
 
 /**
  * Bounded-concurrency map. There is no endpoint that lists users, so the only way to
@@ -94,6 +106,7 @@ export function People() {
   const [teamFilter, setTeamFilter] = useState<number | 'all'>('all')
   const [probes, setProbes] = useState<Record<number, Probe>>({})
   const [profileFor, setProfileFor] = useState<TeamRow | null>(null)
+  const [creating, setCreating] = useState(false)
 
   const load = useCallback(async (force = false) => {
     if (!force && CACHE && Date.now() - CACHE.at < CACHE_TTL_MS) {
@@ -204,6 +217,11 @@ export function People() {
             <Building2 className="size-3.5" /> Edit org profile
           </button>
         )}
+        <button onClick={() => setCreating(true)}
+                className="flex items-center gap-2 rounded-xl bg-brand-500 px-3 py-2
+                           text-xs font-semibold text-white transition hover:bg-brand-600">
+          <UserPlus className="size-3.5" /> Create login
+        </button>
         <button onClick={() => void load(true)}
                 title="Re-fetch every team, ignoring the 2-minute cache"
                 className="flex items-center gap-2 rounded-xl border border-ink-600 bg-ink-800
@@ -238,7 +256,230 @@ export function People() {
       </Card>
 
       {profileFor && <OrgProfileEditor team={profileFor} onClose={() => setProfileFor(null)} />}
+      {creating && (
+        <CreateLogin teams={teams ?? []}
+                     onClose={() => setCreating(false)}
+                     onCreated={() => void load(true)} />
+      )}
     </div>
+  )
+}
+
+/** Shell for the two modals — Card takes no handlers, so the click-through guard
+ *  lives on a wrapper. */
+function Modal({ children, onClose, wide }: {
+  children: React.ReactNode; onClose: () => void; wide?: boolean
+}) {
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm"
+         onClick={onClose}>
+      <div className={wide ? 'w-full max-w-xl' : 'w-full max-w-lg'}
+           onClick={e => e.stopPropagation()}>
+        <Card className="p-6 rise">{children}</Card>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Create a login — POST /auth/register on the deployed backend.
+ *
+ * The gate codes are NOT hardcoded in this repo. They are entered once and kept in
+ * localStorage beside the admin secret: committing PLATFORM_INVITE_CODE and
+ * SUPER_ADMIN_PASS would put the two credentials that let anyone create an account
+ * on this unauthenticated backend into a git history.
+ *
+ * 🔴 team_lead is the ONLY path that ever reveals an invite code. The backend returns
+ * `invite_code` in that one response and NO endpoint reads it back afterwards — see
+ * the note rendered below. So the code is shown once, loudly, with a copy button.
+ */
+function CreateLogin({ teams, onClose, onCreated }: {
+  teams: TeamRow[]; onClose: () => void; onCreated: () => void
+}) {
+  const [kind, setKind] = useState<'team_member' | 'team_lead' | 'personal'>('team_member')
+  const [f, setF] = useState({
+    name: '', email: '', password: '',
+    workspace_invite_code: '', org_name: '',
+  })
+  const [gate, setGate] = useState({
+    platform: localStorage.getItem(LS_PLATFORM_CODE) || '',
+    admin: localStorage.getItem(LS_SUPER_ADMIN) || '',
+  })
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [done, setDone] = useState<RegisteredUser | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  const set = (k: keyof typeof f) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    setF({ ...f, [k]: e.target.value })
+
+  async function submit() {
+    setBusy(true); setErr(null)
+    const body: Record<string, string> = {
+      account_type: kind, name: f.name.trim(),
+      email: f.email.trim(), password: f.password,
+    }
+    if (kind === 'personal') body.platform_invite_code = gate.platform
+    if (kind === 'team_member') body.workspace_invite_code = f.workspace_invite_code.trim()
+    if (kind === 'team_lead') {
+      body.org_name = f.org_name.trim()
+      body.super_admin_code = gate.admin
+    }
+    try {
+      const r = await send<{ success: boolean; user: RegisteredUser }>(
+        '/auth/register', 'POST', body)
+      // Remember the gate codes only once a real registration succeeded — caching a
+      // typo would make every later attempt fail for a reason nobody can see.
+      if (kind === 'personal') localStorage.setItem(LS_PLATFORM_CODE, gate.platform)
+      if (kind === 'team_lead') localStorage.setItem(LS_SUPER_ADMIN, gate.admin)
+      setDone(r!.user)
+      onCreated()
+    } catch (e) {
+      setErr((e as Error).message)
+    } finally { setBusy(false) }
+  }
+
+  if (done) {
+    return (
+      <Modal onClose={onClose}>
+        <div className="mb-4 text-sm font-semibold text-emerald-300">Account created</div>
+        <dl className="space-y-1.5 text-sm">
+          {([['Name', done.name], ['Email', done.email], ['User id', String(done.id)],
+             ['Account type', done.account_type],
+             ['Team', done.team_name ? `${done.team_name} (${done.team_id})` : '—']] as const)
+            .map(([k, v]) => (
+              <div key={k} className="flex gap-3">
+                <dt className="w-28 shrink-0 text-ink-400">{k}</dt>
+                <dd className="font-medium">{v}</dd>
+              </div>
+            ))}
+        </dl>
+
+        {done.invite_code && (
+          <div className="mt-5 rounded-xl border border-amber-500/30 bg-amber-500/[.07] p-4">
+            <div className="text-[11px] font-semibold uppercase tracking-[.12em] text-amber-300">
+              Workspace invite code — copy it now
+            </div>
+            <div className="mt-2 flex items-center gap-3">
+              <code className="rounded-lg bg-ink-850 px-3 py-2 font-mono text-base tracking-wider">
+                {done.invite_code}
+              </code>
+              <button onClick={() => {
+                void navigator.clipboard.writeText(done.invite_code!)
+                setCopied(true)
+              }} className="rounded-lg border border-ink-600 px-2.5 py-1.5 text-[11px]
+                            transition hover:bg-ink-700">
+                {copied ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+            <p className="mt-2.5 text-[11px] leading-relaxed text-amber-200/80">
+              This is the only time it is shown. The backend returns an invite code when a
+              workspace is created and <strong>no endpoint reads it back</strong>, so if you
+              lose it there is no way to recover it from the admin panel — members would
+              have to be added another way.
+            </p>
+          </div>
+        )}
+
+        <button onClick={onClose}
+          className="mt-6 rounded-xl bg-brand-500 px-4 py-2 text-sm font-semibold text-white
+                     transition hover:bg-brand-600">Done</button>
+      </Modal>
+    )
+  }
+
+  const ready = f.name.trim() && f.email.trim() && f.password
+    && (kind !== 'personal' || gate.platform)
+    && (kind !== 'team_member' || f.workspace_invite_code.trim())
+    && (kind !== 'team_lead' || (f.org_name.trim() && gate.admin))
+
+  return (
+    <Modal onClose={onClose} wide>
+      <div className="mb-5">
+        <div className="text-sm font-semibold">Create a login</div>
+        <div className="text-[11px] text-ink-500">POST /auth/register on the live backend</div>
+      </div>
+
+      <div className="mb-5 flex gap-2">
+        {(['team_member', 'team_lead', 'personal'] as const).map(k => (
+          <button key={k} onClick={() => { setKind(k); setErr(null) }}
+            className={cx('rounded-xl px-3 py-2 text-xs font-medium transition',
+              kind === k ? 'bg-brand-500/15 text-brand-400 ring-1 ring-brand-500/30'
+                         : 'border border-ink-600 text-ink-300 hover:bg-ink-800')}>
+            {k.replace('_', ' ')}
+          </button>
+        ))}
+      </div>
+
+      <div className="space-y-4">
+        <Field label="Full name">
+          <input className={inputCls} value={f.name} onChange={set('name')} />
+        </Field>
+        <Field label="Email">
+          <input className={inputCls} value={f.email} onChange={set('email')}
+                 type="email" spellCheck={false} autoComplete="off" />
+        </Field>
+        <Field label="Password">
+          <input className={inputCls} value={f.password} onChange={set('password')}
+                 type="text" spellCheck={false} autoComplete="off" />
+        </Field>
+
+        {kind === 'team_member' && (
+          <>
+            <Field label="Workspace invite code">
+              <input className={inputCls} value={f.workspace_invite_code}
+                     onChange={set('workspace_invite_code')}
+                     placeholder="e.g. OSC-G289ZU" spellCheck={false} />
+            </Field>
+            <p className="text-[11px] leading-relaxed text-ink-500">
+              You have to type this — the deployed API exposes invite codes only in the
+              response when a workspace is first created, and there is no endpoint that
+              lists them for the {teams.length} existing teams.
+            </p>
+          </>
+        )}
+
+        {kind === 'team_lead' && (
+          <>
+            <Field label="Organisation name (creates a new workspace)">
+              <input className={inputCls} value={f.org_name} onChange={set('org_name')} />
+            </Field>
+            <Field label="Super admin code">
+              <input className={inputCls} value={gate.admin} type="password"
+                     onChange={e => setGate({ ...gate, admin: e.target.value })}
+                     placeholder="SUPER_ADMIN_PASS" autoComplete="off" />
+            </Field>
+          </>
+        )}
+
+        {kind === 'personal' && (
+          <Field label="Platform invite code">
+            <input className={inputCls} value={gate.platform} type="password"
+                   onChange={e => setGate({ ...gate, platform: e.target.value })}
+                   placeholder="PLATFORM_INVITE_CODE" autoComplete="off" />
+          </Field>
+        )}
+
+        {err && <ErrorBox error={err} />}
+
+        <div className="flex items-center gap-3 pt-1">
+          <button onClick={() => void submit()} disabled={busy || !ready}
+            className="rounded-xl bg-brand-500 px-4 py-2 text-sm font-semibold text-white
+                       transition hover:bg-brand-600 disabled:opacity-40">
+            {busy ? 'Creating…' : 'Create account'}
+          </button>
+          <button onClick={onClose}
+            className="rounded-xl border border-ink-600 px-4 py-2 text-sm transition hover:bg-ink-800">
+            Cancel
+          </button>
+        </div>
+
+        <p className="text-[11px] leading-relaxed text-ink-500">
+          This writes a real account to the live database. The gate codes are kept in this
+          browser only — they are never committed to the repo.
+        </p>
+      </div>
+    </Modal>
   )
 }
 
@@ -379,11 +620,8 @@ function OrgProfileEditor({ team, onClose }: { team: TeamRow; onClose: () => voi
   }
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4 backdrop-blur-sm"
-         onClick={onClose}>
-      {/* Card takes no handlers, so the click-through guard lives on a wrapper. */}
-      <div className="w-full max-w-lg" onClick={e => e.stopPropagation()}>
-      <Card className="p-6 rise">
+    <Modal onClose={onClose}>
+      <>
         <div className="mb-5">
           <div className="text-sm font-semibold">Org profile · {team.name}</div>
           <div className="text-[11px] text-ink-500">team {team.id} — shown in the app's business info box</div>
@@ -429,8 +667,7 @@ function OrgProfileEditor({ team, onClose }: { team: TeamRow; onClose: () => voi
               </div>
             </div>
           )}
-      </Card>
-      </div>
-    </div>
+      </>
+    </Modal>
   )
 }
