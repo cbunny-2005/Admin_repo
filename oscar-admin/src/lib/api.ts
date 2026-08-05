@@ -1,4 +1,9 @@
-/** Backend client. Every call carries X-Admin-Secret; nothing here writes. */
+/**
+ * Backend client. Every call carries X-Admin-Secret.
+ *
+ * Reads use api(); the few writes use send(). ONLY endpoints that exist on the
+ * deployed backend are used here — nothing in this panel assumes unreleased code.
+ */
 
 const LS_URL = 'oscar.admin.baseUrl'
 const LS_SECRET = 'oscar.admin.secret'
@@ -48,6 +53,48 @@ export async function api<T>(path: string, signal?: AbortSignal): Promise<T> {
         `(${location.origin}) is not in the backend's CORS_ORIGINS.`,
     )
   }
+  if (res.status === 401) throw new ApiError(401, 'Admin secret rejected.')
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`
+    try {
+      const j = await res.json()
+      if (j?.detail) detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)
+    } catch { /* non-JSON error body — keep the status line */ }
+    throw new ApiError(res.status, detail)
+  }
+  return res.json() as Promise<T>
+}
+
+/**
+ * Writes. Same error contract as api(), plus the body.
+ *
+ * `notFoundAsNull` exists for ONE caller: POST /notifications/test answers 404
+ * "No active device tokens for this user", which is not a failure — it is the
+ * answer. It is the only way this backend will tell us a user is unreachable,
+ * since no deployed endpoint exposes device tokens.
+ */
+export async function send<T>(
+  path: string,
+  method: 'POST' | 'PUT' | 'PATCH',
+  body: unknown,
+  opts: { notFoundAsNull?: boolean } = {},
+): Promise<T | null> {
+  const base = getBase()
+  let res: Response
+  try {
+    res = await fetch(base + path, {
+      method,
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': getSecret() },
+      body: JSON.stringify(body),
+    })
+  } catch {
+    throw new ApiError(
+      0,
+      `Cannot reach ${base}. Either the host is down, or this page's origin ` +
+        `(${location.origin}) is not in the backend's CORS_ORIGINS.`,
+    )
+  }
+  if (res.status === 404 && opts.notFoundAsNull) return null
   if (res.status === 401) throw new ApiError(401, 'Admin secret rejected.')
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`
@@ -118,4 +165,37 @@ export type McpRow = {
   env_value: string | null
   resolved: string[]
   tool_mode: boolean
+}
+
+export type TeamRow = { id: number; name: string }
+
+/**
+ * GET /teams/{id}/members. Note what is NOT here: no username, no email, no device
+ * tokens. This is everything the deployed API will tell us about a person, which is
+ * why People search matches on `name` only.
+ *
+ * `last_seen` is stamped when their last WebSocket DISCONNECTS — it is not a login
+ * time (nothing records logins) and it is null while they are online.
+ */
+export type MemberRow = {
+  user_id: number; name: string; role: string; is_active: number
+  joined_at: string | null; online: boolean; last_seen: string | null
+}
+
+export type NotificationRow = {
+  id: number; user_id: number; type: string; message: string
+  is_read: number; item_id: number | null
+  created_at: string | null; read_at: string | null
+}
+
+/** POST /notifications/test. A 404 instead of this shape means no active tokens. */
+export type PushResult = {
+  success: boolean; success_count: number; failure_count: number
+  invalid_tokens: string[]
+}
+
+/** GET /assistant/business — the only deployed way to READ an org profile back. */
+export type BusinessProfile = {
+  business: string | null; note: string | null; details: string | null
+  capabilities: string[]; getting_started: string[]
 }

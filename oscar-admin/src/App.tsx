@@ -1,17 +1,22 @@
 import { useEffect, useState } from 'react'
 import {
-  Camera, KeyRound, LayoutDashboard, LogOut, MessagesSquare, Phone, RefreshCw, Server,
+  Camera, KeyRound, LayoutDashboard, LogOut, MessagesSquare, Phone, RefreshCw, Server, Users,
 } from 'lucide-react'
 import { DEFAULT_BASE, clearCreds, getBase, getSecret, setCreds } from './lib/api'
 import { Card, Field, cx, inputCls } from './ui'
 import { Mcp, Overview, Photos, Sessions, Whatsapp } from './views'
+import { People } from './people'
 
+// `writes` drives the per-page subtitle. Most of this panel reads; People can send a
+// real push and edit an org profile, and a page that can touch a customer's phone
+// should say so rather than inherit a blanket "nothing here writes".
 const NAV = [
-  { id: 'overview', label: 'Overview',  icon: LayoutDashboard, view: Overview },
-  { id: 'photos',   label: 'Photos & contacts', icon: Camera,  view: Photos },
-  { id: 'sessions', label: 'Sessions',  icon: MessagesSquare,  view: Sessions },
-  { id: 'whatsapp', label: 'WhatsApp',  icon: Phone,           view: Whatsapp },
-  { id: 'mcp',      label: 'MCP config', icon: Server,         view: Mcp },
+  { id: 'overview', label: 'Overview',  icon: LayoutDashboard, view: Overview, writes: false },
+  { id: 'people',   label: 'People',    icon: Users,           view: People,   writes: true  },
+  { id: 'photos',   label: 'Photos & contacts', icon: Camera,  view: Photos,   writes: false },
+  { id: 'sessions', label: 'Sessions',  icon: MessagesSquare,  view: Sessions, writes: false },
+  { id: 'whatsapp', label: 'WhatsApp',  icon: Phone,           view: Whatsapp, writes: false },
+  { id: 'mcp',      label: 'MCP config', icon: Server,         view: Mcp,      writes: false },
 ] as const
 
 export default function App() {
@@ -36,7 +41,7 @@ export default function App() {
                           from-brand-400 to-brand-600 text-sm font-bold text-white">O</div>
           <div>
             <div className="text-sm font-semibold leading-tight">Oscar Admin</div>
-            <div className="text-[10px] text-ink-400">read-only</div>
+            <div className="text-[10px] text-ink-400">operations</div>
           </div>
         </div>
 
@@ -70,7 +75,9 @@ export default function App() {
           <div>
             <h1 className="text-xl font-semibold tracking-tight">{active.label}</h1>
             <p className="mt-0.5 text-xs text-ink-400">
-              Live data from the Oscar backend. Nothing on this page writes.
+              {active.writes
+                ? 'Live data from the Oscar backend. This page can send a real push and edit an org profile.'
+                : 'Live data from the Oscar backend. Nothing on this page writes.'}
             </p>
           </div>
           <button onClick={() => setNonce(n => n + 1)}
