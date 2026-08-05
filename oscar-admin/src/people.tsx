@@ -17,12 +17,53 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Bell, Building2, Loader2, Search } from 'lucide-react'
+import { Bell, Building2, Loader2, RotateCw, Search } from 'lucide-react'
 import { api, send } from './lib/api'
 import type { BusinessProfile, McpRow, MemberRow, NotificationRow, PushResult, TeamRow } from './lib/api'
 import { Badge, Card, Empty, ErrorBox, Field, Spinner, Table, Td, cx, inputCls } from './ui'
 
 type Person = MemberRow & { team_id: number; team_name: string }
+
+/**
+ * Bounded-concurrency map. There is no endpoint that lists users, so the only way to
+ * enumerate people is one call per team — 59 of them.
+ *
+ * Measured against the live service: ~0.4s per call, so sequential is ~24s of staring
+ * at a spinner, while 8 at a time finishes 8 calls in ~1.0s. An earlier version ran
+ * these sequentially to be kind to "a free tier"; Developement_BRANCH is on the
+ * STARTER plan, so that caution was unfounded and cost 20 seconds on every visit.
+ *
+ * Still bounded rather than all-59-at-once: 59 concurrent sockets against a
+ * single-worker uvicorn is a good way to make the whole backend feel broken for
+ * everyone actually using the app.
+ */
+async function pool<T, R>(
+  items: T[], limit: number,
+  fn: (item: T) => Promise<R>,
+  onProgress?: (done: number) => void,
+): Promise<R[]> {
+  const out = new Array<R>(items.length)
+  let next = 0
+  let done = 0
+  const worker = async () => {
+    for (;;) {
+      const i = next++
+      if (i >= items.length) return
+      out[i] = await fn(items[i])
+      onProgress?.(++done)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return out
+}
+
+/**
+ * Module-level so switching tabs and coming back is instant instead of another full
+ * sweep. Short TTL because membership changes are rare but not never, and the view's
+ * own Reload button bypasses it entirely.
+ */
+let CACHE: { at: number; people: Person[]; teams: TeamRow[] } | null = null
+const CACHE_TTL_MS = 120_000
 
 /** "online" · "3h ago" · "—". last_seen is a disconnect time, so recency is what matters. */
 function ago(iso: string | null): string {
@@ -54,31 +95,38 @@ export function People() {
   const [probes, setProbes] = useState<Record<number, Probe>>({})
   const [profileFor, setProfileFor] = useState<TeamRow | null>(null)
 
-  // One pass over every team. Sequential on purpose: this is a free-tier backend and
-  // 60 parallel requests is how you get rate-limited on the first page load.
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = false) => {
+    if (!force && CACHE && Date.now() - CACHE.at < CACHE_TTL_MS) {
+      setTeams(CACHE.teams); setPeople(CACHE.people); setProgress(100)
+      return
+    }
     setError(null); setPeople(null); setProgress(0)
     try {
       const ts = await api<TeamRow[]>('/teams')
       setTeams(ts)
-      const all: Person[] = []
-      for (let i = 0; i < ts.length; i++) {
-        const t = ts[i]
-        try {
-          const ms = await api<MemberRow[]>(`/teams/${t.id}/members`)
-          for (const m of ms) all.push({ ...m, team_id: t.id, team_name: t.name })
-        } catch {
-          // A single unreadable team must not cost us the other 47.
-        }
-        setProgress(Math.round(((i + 1) / ts.length) * 100))
-      }
+
+      const perTeam = await pool(
+        ts, 8,
+        async t => {
+          try {
+            const ms = await api<MemberRow[]>(`/teams/${t.id}/members`)
+            return ms.map(m => ({ ...m, team_id: t.id, team_name: t.name }))
+          } catch {
+            return [] as Person[]   // one unreadable team must not cost us the other 58
+          }
+        },
+        done => setProgress(Math.round((done / ts.length) * 100)),
+      )
+
       // Someone in two teams appears twice; keep the row that shows them active.
       const byUser = new Map<number, Person>()
-      for (const p of all) {
+      for (const p of perTeam.flat()) {
         const prev = byUser.get(p.user_id)
         if (!prev || (!prev.is_active && p.is_active)) byUser.set(p.user_id, p)
       }
-      setPeople([...byUser.values()].sort((a, b) => a.name.localeCompare(b.name)))
+      const list = [...byUser.values()].sort((a, b) => a.name.localeCompare(b.name))
+      CACHE = { at: Date.now(), people: list, teams: ts }
+      setPeople(list)
     } catch (e) {
       setError((e as Error).message)
     }
@@ -89,10 +137,16 @@ export function People() {
   const shown = useMemo(() => {
     if (!people) return []
     const needle = q.trim().toLowerCase()
-    return people.filter(p =>
-      (teamFilter === 'all' || p.team_id === teamFilter) &&
-      (!needle || p.name.toLowerCase().includes(needle) || String(p.user_id) === needle),
-    )
+    // Ids match EXACTLY, text matches as a substring. A substring id match would make
+    // "3" return users 3, 13, 30, 33 and every team containing a 3 — useless when the
+    // whole point of typing an id is to land on one row.
+    const match = (p: Person) =>
+      !needle ||
+      p.name.toLowerCase().includes(needle) ||
+      p.team_name.toLowerCase().includes(needle) ||
+      String(p.user_id) === needle ||
+      String(p.team_id) === needle
+    return people.filter(p => (teamFilter === 'all' || p.team_id === teamFilter) && match(p))
   }, [people, q, teamFilter])
 
   async function probe(p: Person) {
@@ -126,11 +180,11 @@ export function People() {
     <div className="space-y-5">
       <Card className="flex flex-wrap items-end gap-3 p-4">
         <div className="min-w-56 flex-1">
-          <Field label="Search by name or user id">
+          <Field label="Search by user name, user id, team name or team id">
             <div className="relative">
               <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-ink-600" />
               <input value={q} onChange={e => setQ(e.target.value)} className={inputCls + ' pl-8'}
-                     placeholder="e.g. Swathi, or 33" spellCheck={false} />
+                     placeholder="name, user id, team…" spellCheck={false} />
             </div>
           </Field>
         </div>
@@ -150,6 +204,12 @@ export function People() {
             <Building2 className="size-3.5" /> Edit org profile
           </button>
         )}
+        <button onClick={() => void load(true)}
+                title="Re-fetch every team, ignoring the 2-minute cache"
+                className="flex items-center gap-2 rounded-xl border border-ink-600 bg-ink-800
+                           px-3 py-2 text-xs font-medium transition hover:bg-ink-700">
+          <RotateCw className="size-3.5" /> Reload
+        </button>
         <div className="ml-auto text-xs text-ink-400">
           {shown.length} of {people.length}
         </div>
@@ -158,8 +218,9 @@ export function People() {
       {/* The API exposes no username/email and no device tokens. Saying so here stops
           the next person assuming the panel is just failing to show them. */}
       <p className="text-[11px] leading-relaxed text-ink-500">
-        Search matches <strong className="text-ink-400">name</strong> only — the backend exposes no
-        username or email. <strong className="text-ink-400">Last seen</strong> is when their app
+        Search matches <strong className="text-ink-400">user name, user id, team name and team
+        id</strong> — ids exactly, text as a substring. No username or email: the backend exposes
+        neither. <strong className="text-ink-400">Last seen</strong> is when their app
         connection last dropped, not a login (nothing records logins). The
         <strong className="text-ink-400"> bell sends a real push</strong>: it is the only way to
         learn whether a device is reachable, because no endpoint returns device tokens.
