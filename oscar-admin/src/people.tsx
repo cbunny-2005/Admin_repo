@@ -17,7 +17,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Bell, Building2, Loader2, RotateCw, Search, UserPlus } from 'lucide-react'
+import { Bell, Building2, Loader2, RotateCw, Search, ShieldCheck, UserPlus } from 'lucide-react'
 import { api, send } from './lib/api'
 import type { BusinessProfile, McpRow, MemberRow, NotificationRow, PushResult, TeamRow } from './lib/api'
 import { Badge, Card, Empty, ErrorBox, Field, Spinner, Table, Td, cx, inputCls } from './ui'
@@ -32,7 +32,21 @@ type RegisteredUser = {
   invite_code?: string | null; onboarding_state?: string
 }
 
-// Kept beside the admin secret, in the browser — never in the repo.
+/**
+ * The two gate codes POST /auth/register checks.
+ *
+ * Loaded from `.env.local`, which Vite reads at startup and `.gitignore` excludes via
+ * `*.local`. So they are filled in automatically and never typed, while still staying
+ * out of the repository — putting the credentials that let anyone create an account on
+ * an unauthenticated backend into a git history is the thing worth avoiding, not the
+ * typing.
+ *
+ * localStorage remains the fallback for a checkout with no .env.local, so the form
+ * still works rather than silently failing with INVALID_*_CODE.
+ */
+const ENV_PLATFORM_CODE = import.meta.env.VITE_PLATFORM_INVITE_CODE as string | undefined
+const ENV_SUPER_ADMIN = import.meta.env.VITE_SUPER_ADMIN_CODE as string | undefined
+
 const LS_PLATFORM_CODE = 'oscar.admin.platformInviteCode'
 const LS_SUPER_ADMIN = 'oscar.admin.superAdminCode'
 
@@ -265,6 +279,21 @@ export function People() {
   )
 }
 
+/** Stands in for a gate-code field that came from .env.local. Shown rather than
+ *  omitted entirely so it is obvious the code IS being sent — a silently-missing
+ *  field looks like the form forgot it, and the resulting INVALID_*_CODE would send
+ *  someone hunting in the wrong place. */
+function GateLoaded({ label }: { label: string }) {
+  return (
+    <div className="flex items-center gap-2 rounded-xl border border-ink-700 bg-ink-850/60
+                    px-3 py-2.5 text-[11px] text-ink-400">
+      <ShieldCheck className="size-3.5 shrink-0 text-emerald-400" />
+      <span><strong className="text-ink-300">{label}</strong> loaded from
+        <span className="font-mono"> .env.local</span> — sent automatically</span>
+    </div>
+  )
+}
+
 /** Shell for the two modals — Card takes no handlers, so the click-through guard
  *  lives on a wrapper. */
 function Modal({ children, onClose, wide }: {
@@ -302,8 +331,8 @@ function CreateLogin({ teams, onClose, onCreated }: {
     workspace_invite_code: '', org_name: '',
   })
   const [gate, setGate] = useState({
-    platform: localStorage.getItem(LS_PLATFORM_CODE) || '',
-    admin: localStorage.getItem(LS_SUPER_ADMIN) || '',
+    platform: ENV_PLATFORM_CODE || localStorage.getItem(LS_PLATFORM_CODE) || '',
+    admin: ENV_SUPER_ADMIN || localStorage.getItem(LS_SUPER_ADMIN) || '',
   })
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -444,20 +473,28 @@ function CreateLogin({ teams, onClose, onCreated }: {
             <Field label="Organisation name (creates a new workspace)">
               <input className={inputCls} value={f.org_name} onChange={set('org_name')} />
             </Field>
-            <Field label="Super admin code">
-              <input className={inputCls} value={gate.admin} type="password"
-                     onChange={e => setGate({ ...gate, admin: e.target.value })}
-                     placeholder="SUPER_ADMIN_PASS" autoComplete="off" />
-            </Field>
+            {ENV_SUPER_ADMIN
+              ? <GateLoaded label="Super admin code" />
+              : (
+                <Field label="Super admin code">
+                  <input className={inputCls} value={gate.admin} type="password"
+                         onChange={e => setGate({ ...gate, admin: e.target.value })}
+                         placeholder="SUPER_ADMIN_PASS" autoComplete="off" />
+                </Field>
+              )}
           </>
         )}
 
         {kind === 'personal' && (
-          <Field label="Platform invite code">
-            <input className={inputCls} value={gate.platform} type="password"
-                   onChange={e => setGate({ ...gate, platform: e.target.value })}
-                   placeholder="PLATFORM_INVITE_CODE" autoComplete="off" />
-          </Field>
+          ENV_PLATFORM_CODE
+            ? <GateLoaded label="Platform invite code" />
+            : (
+              <Field label="Platform invite code">
+                <input className={inputCls} value={gate.platform} type="password"
+                       onChange={e => setGate({ ...gate, platform: e.target.value })}
+                       placeholder="PLATFORM_INVITE_CODE" autoComplete="off" />
+              </Field>
+            )
         )}
 
         {err && <ErrorBox error={err} />}
