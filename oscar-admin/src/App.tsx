@@ -94,9 +94,15 @@ export default function App() {
   )
 }
 
+// Optional convenience: .env.local (gitignored via *.local) can supply the secret so
+// the login screen is pre-filled. Deliberately NOT auto-submitted — the screen still
+// verifies against /admin/overview, which is what turns a stale secret into one clear
+// message instead of five identical 401s across five views.
+const ENV_ADMIN_SECRET = import.meta.env.VITE_ADMIN_SECRET as string | undefined
+
 function Login({ onDone }: { onDone: () => void }) {
   const [base, setBase] = useState(getBase() || DEFAULT_BASE)
-  const [secret, setSecret] = useState('')
+  const [secret, setSecret] = useState(ENV_ADMIN_SECRET || '')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
 
