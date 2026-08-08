@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
 import {
-  Camera, KeyRound, LayoutDashboard, LogOut, MessagesSquare, Mic, Phone, RefreshCw, Server, Users,
+  Camera, KeyRound, LayoutDashboard, LogOut, MessagesSquare, Mic, Phone, RefreshCw, Server, Users, Zap,
 } from 'lucide-react'
 import { DEFAULT_BASE, clearCreds, getBase, getSecret, setCreds } from './lib/api'
 import { Card, Field, cx, inputCls } from './ui'
 import { Mcp, Overview, Photos, Sessions, Whatsapp } from './views'
 import { People } from './people'
 import { Voice } from './voice'
+import { Realtime } from './realtime'
 
 // `writes` drives the per-page subtitle. Most of this panel reads; People can send a
 // real push and edit an org profile, and a page that can touch a customer's phone
@@ -21,6 +22,9 @@ const NAV = [
   // writes: true — the voice bench posts to the live POST /chat, which lands in a
   // real person's history and pushes to their phone.
   { id: 'voice',    label: 'Voice (Sarvam)', icon: Mic,        view: Voice,    writes: true  },
+  // The comparison: one speech-to-speech model instead of STT+LLM+TTS. No tools,
+  // so it writes nothing.
+  { id: 'realtime', label: 'Voice (OpenAI Realtime)', icon: Zap, view: Realtime, writes: false },
 ] as const
 
 export default function App() {

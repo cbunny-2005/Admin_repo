@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertTriangle, Phone, PhoneOff } from 'lucide-react'
+import { AlertTriangle, Phone, PhoneOff, RotateCcw } from 'lucide-react'
 import { LiveVoice, SPEAKERS, type Phase, type Timings } from './lib/liveVoice'
 import { Card, ErrorBox, Field, cx, inputCls } from './ui'
 
@@ -42,6 +42,7 @@ export function Voice() {
   // their phone — which is exactly what happened with 7 (Sathvik).
   const [userId, setUserId] = useState('90')
   const [speaker, setSpeaker] = useState('dev')
+  const [note, setNote] = useState<string | null>(null)
 
   const engine = useRef<LiveVoice | null>(null)
 
@@ -74,6 +75,17 @@ export function Voice() {
     await lv.start()
   }, [userId, speaker])
 
+  /** Fresh conversation without hanging up. Oscar carries the last ~20 turns within
+   *  a session, which is what makes follow-ups work — and also what makes it keep
+   *  answering the PREVIOUS topic once you have moved on. */
+  const newSession = useCallback(async () => {
+    const id = await engine.current?.newSession()
+    setHeard(''); setReply(''); setT({}); setError(null)
+    setLog([])
+    if (id) setNote(`New session #${id}`)
+    setTimeout(() => setNote(null), 2500)
+  }, [])
+
   const live = phase !== 'idle'
   // The orb breathes with mic level while listening and pulses on its own otherwise,
   // so the page never looks frozen during the LLM wait.
@@ -96,7 +108,17 @@ export function Voice() {
                 {SPEAKERS.map(sp => <option key={sp} value={sp}>{sp}</option>)}
               </select>
             </Field>
+            <button
+              onClick={newSession}
+              disabled={!live}
+              title="Start a fresh conversation — clears what Oscar remembers"
+              className={cx('flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition',
+                live ? 'bg-white/10 hover:bg-white/15' : 'bg-white/5 opacity-40')}
+            >
+              <RotateCcw className="size-4" /> New session
+            </button>
           </div>
+          {note && <div className="text-xs text-brand-400">{note}</div>}
           <button
             onClick={toggle}
             aria-label={live ? 'End call' : 'Start call'}
