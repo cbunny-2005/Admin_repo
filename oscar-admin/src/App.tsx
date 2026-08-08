@@ -108,6 +108,9 @@ function Login({ onDone }: { onDone: () => void }) {
   const [secret, setSecret] = useState(ENV_ADMIN_SECRET || '')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  // Hidden by default; revealed only if someone needs to point at a different
+  // backend, or automatically when a connection error means the URL is the suspect.
+  const [showAdvanced, setShowAdvanced] = useState(false)
 
   useEffect(() => { document.title = 'Oscar Admin' }, [])
 
@@ -125,9 +128,13 @@ function Login({ onDone }: { onDone: () => void }) {
       onDone()
     } catch (e) {
       clearCreds()
-      setErr(e instanceof TypeError
-        ? `Cannot reach ${base}. Check the URL, and that ${location.origin} is in CORS_ORIGINS.`
-        : (e as Error).message)
+      if (e instanceof TypeError) {
+        setShowAdvanced(true)
+        setErr(`Cannot reach the backend. Check the URL below, and that ${location.origin} `
+               + 'is in CORS_ORIGINS.')
+      } else {
+        setErr((e as Error).message)
+      }
     } finally { setBusy(false) }
   }
 
@@ -144,10 +151,18 @@ function Login({ onDone }: { onDone: () => void }) {
         </div>
 
         <form onSubmit={submit} className="space-y-4">
-          <Field label="Backend URL">
-            <input value={base} onChange={e => setBase(e.target.value)} className={inputCls}
-                   placeholder="https://…onrender.com" spellCheck={false} />
-          </Field>
+          {/* The backend URL is NOT on this screen. On a public deployment the login
+              page is the one thing an unauthenticated visitor sees, and printing the
+              API host there hands them the target for free — this backend has no auth
+              outside /admin/*, so the URL is the only thing between a stranger and
+              /teams/{id}/members. It stays available to whoever is already inside
+              (the toggle below), which is the only person who needs it. */}
+          {showAdvanced && (
+            <Field label="Backend URL">
+              <input value={base} onChange={e => setBase(e.target.value)} className={inputCls}
+                     placeholder="https://…onrender.com" spellCheck={false} />
+            </Field>
+          )}
           <Field label="Admin secret">
             <div className="relative">
               <KeyRound className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-ink-600" />
@@ -159,6 +174,13 @@ function Login({ onDone }: { onDone: () => void }) {
           {err && (
             <div className="rounded-xl border border-rose-500/25 bg-rose-500/[.06] px-3 py-2.5
                             text-xs leading-relaxed text-rose-200">{err}</div>
+          )}
+
+          {!showAdvanced && (
+            <button type="button" onClick={() => setShowAdvanced(true)}
+                    className="text-xs text-ink-600 hover:text-ink-300">
+              Use a different backend
+            </button>
           )}
 
           <button type="submit" disabled={busy || !secret}
