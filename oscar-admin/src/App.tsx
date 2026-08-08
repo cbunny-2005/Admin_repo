@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
 import {
-  Camera, KeyRound, LayoutDashboard, LogOut, MessagesSquare, Phone, RefreshCw, Server, Users,
+  Camera, GraduationCap, KeyRound, LayoutDashboard, LogOut, MessagesSquare, Phone, RefreshCw, Server, Users,
 } from 'lucide-react'
 import { DEFAULT_BASE, clearCreds, getBase, getSecret, setCreds } from './lib/api'
 import { Card, Field, cx, inputCls } from './ui'
 import { Mcp, Overview, Photos, Sessions, Whatsapp } from './views'
 import { People } from './people'
+import { Program } from './program'
 
 // `writes` drives the per-page subtitle. Most of this panel reads; People can send a
 // real push and edit an org profile, and a page that can touch a customer's phone
@@ -13,6 +14,8 @@ import { People } from './people'
 const NAV = [
   { id: 'overview', label: 'Overview',  icon: LayoutDashboard, view: Overview, writes: false },
   { id: 'people',   label: 'People',    icon: Users,           view: People,   writes: true  },
+  // Creates real tasks and posts real comments for the programme cohort.
+  { id: 'program',  label: 'Alumnx AI Engineer', icon: GraduationCap, view: Program, writes: true },
   { id: 'photos',   label: 'Photos & contacts', icon: Camera,  view: Photos,   writes: false },
   { id: 'sessions', label: 'Sessions',  icon: MessagesSquare,  view: Sessions, writes: false },
   { id: 'whatsapp', label: 'WhatsApp',  icon: Phone,           view: Whatsapp, writes: false },
