@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
 import {
-  Camera, KeyRound, LayoutDashboard, LogOut, MessagesSquare, Phone, RefreshCw, Server, Users,
+  Camera, KeyRound, LayoutDashboard, LogOut, MessagesSquare, Mic, Phone, RefreshCw, Server, Users,
 } from 'lucide-react'
 import { DEFAULT_BASE, clearCreds, getBase, getSecret, setCreds } from './lib/api'
 import { Card, Field, cx, inputCls } from './ui'
 import { Mcp, Overview, Photos, Sessions, Whatsapp } from './views'
 import { People } from './people'
+import { Voice } from './voice'
 
 // `writes` drives the per-page subtitle. Most of this panel reads; People can send a
 // real push and edit an org profile, and a page that can touch a customer's phone
@@ -17,6 +18,9 @@ const NAV = [
   { id: 'sessions', label: 'Sessions',  icon: MessagesSquare,  view: Sessions, writes: false },
   { id: 'whatsapp', label: 'WhatsApp',  icon: Phone,           view: Whatsapp, writes: false },
   { id: 'mcp',      label: 'MCP config', icon: Server,         view: Mcp,      writes: false },
+  // writes: true — the voice bench posts to the live POST /chat, which lands in a
+  // real person's history and pushes to their phone.
+  { id: 'voice',    label: 'Voice (Sarvam)', icon: Mic,        view: Voice,    writes: true  },
 ] as const
 
 export default function App() {
