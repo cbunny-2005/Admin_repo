@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { CheckCircle2, ChevronLeft, Loader2, MessageSquare, Send, Users } from 'lucide-react'
+import { CheckCircle2, ChevronLeft, Loader2, MessageSquare, Send, UserPlus, Users } from 'lucide-react'
 import { api, send } from './lib/api'
 import { Badge, Card, ErrorBox, Field, Spinner, cx, inputCls } from './ui'
 
@@ -27,11 +27,18 @@ const TEAM_ID = Number(import.meta.env.VITE_PROGRAM_TEAM_ID ?? 65)
 type Member = {
   user_id: number; name: string; role: string; online?: boolean
 }
+type Assignee = {
+  user_id: number; name: string | null
+  status: 'completed' | 'pending'; completed_at?: string | null
+}
 type Task = {
   id: number; title: string; description?: string | null; status: string
   due_at?: string | null; due_label?: string; is_overdue?: boolean
   assignee_count?: number; completed_count?: number; pending_count?: number
   owner_name?: string; assigned_to_name?: string
+  // Per-person completion state. Capped server-side at 25, so on a very large task
+  // this is the caller's own row only — assignees_truncated says which.
+  assignees?: Assignee[]; assignees_truncated?: boolean
 }
 type Comment = {
   id: number; user_id: number; user_name?: string; role: string
@@ -79,7 +86,11 @@ export function Program() {
   if (!lead) return <ErrorBox error={`Team ${TEAM_ID} has no active team_lead — a task needs an owner.`} />
 
   if (open) {
-    return <Thread task={open} leadId={lead.user_id} onBack={() => { setOpen(null); void load() }} />
+    return (
+      <Thread task={open} leadId={lead.user_id} members={members}
+              onChanged={t => { setOpen({ ...open, ...t }); void load() }}
+              onBack={() => { setOpen(null); void load() }} />
+    )
   }
 
   return (
@@ -269,10 +280,12 @@ function TaskList({ tasks, onOpen }: { tasks: Task[]; onOpen: (t: Task) => void 
 
 // ── Thread ──────────────────────────────────────────────────────────────────
 
-function Thread({ task, leadId, onBack }: {
-  task: Task; leadId: number; onBack: () => void
+function Thread({ task, leadId, members, onBack, onChanged }: {
+  task: Task; leadId: number; members: Member[]
+  onBack: () => void; onChanged: (t: Task) => void
 }) {
   const [comments, setComments] = useState<Comment[] | null>(null)
+  const [adding, setAdding] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [body, setBody] = useState('')
   const [busy, setBusy] = useState(false)
@@ -301,6 +314,22 @@ function Thread({ task, leadId, onBack }: {
 
   const total = task.assignee_count ?? 1
   const done = task.completed_count ?? 0
+  const roster = task.assignees ?? []
+  const assignedIds = new Set(roster.map(a => a.user_id))
+  // Team members not on this task yet. The lead is excluded: they are assigning, not
+  // doing, and adding them would hold the task open until they "completed" it too.
+  const missing = members.filter(m => m.user_id !== leadId && !assignedIds.has(m.user_id))
+
+  /** Add everyone on the team who is not already on the task. Uses the same
+   *  server-side expansion as creation, so it cannot miss a late joiner. */
+  async function addEveryone() {
+    setAdding(true)
+    try {
+      const r = await send<{ task: Task }>(`/items/${task.id}`, 'PATCH',
+                                          { user_id: leadId, assign_to_all_members: true })
+      if (r?.task) onChanged(r.task)
+    } catch (e) { setError((e as Error).message) } finally { setAdding(false) }
+  }
 
   return (
     <div className="space-y-6">
@@ -323,6 +352,50 @@ function Thread({ task, leadId, onBack }: {
             </div>
           )}
         </div>
+        {/* Assignees FIRST — who is on this and who has finished is the question this
+            page exists to answer; the description is reference material below it. */}
+        {roster.length > 0 && (
+          <div>
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs font-semibold uppercase tracking-wide text-ink-600">
+                Assigned to {task.assignees_truncated
+                  ? `(${total} people — list capped by the server)` : `(${total})`}
+              </span>
+              {missing.length > 0 && (
+                <button onClick={addEveryone} disabled={adding}
+                        className="flex items-center gap-1.5 rounded-lg bg-white/5 px-2.5 py-1
+                                   text-xs font-semibold hover:bg-white/10 disabled:opacity-50">
+                  {adding ? <Loader2 className="size-3.5 animate-spin" />
+                          : <UserPlus className="size-3.5" />}
+                  Add {missing.length} missing
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {[...roster]
+                // Done first, so progress reads at a glance.
+                .sort((a, b) => (a.status === b.status ? 0 : a.status === 'completed' ? -1 : 1))
+                .map(a => (
+                  <span key={a.user_id}
+                        title={a.completed_at ? `completed ${a.completed_at}` : 'not done yet'}
+                        className={cx('flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs',
+                          a.status === 'completed'
+                            ? 'bg-emerald-500/15 text-emerald-300'
+                            : 'bg-white/5 text-ink-400')}>
+                    {a.status === 'completed' && <CheckCircle2 className="size-3" />}
+                    {a.name ?? `user ${a.user_id}`}
+                  </span>
+                ))}
+            </div>
+            {missing.length > 0 && (
+              <p className="mt-2 text-xs text-amber-500/90">
+                {missing.length} team member{missing.length > 1 ? 's are' : ' is'} NOT on this
+                task: {missing.map(m => m.name).join(', ')}
+              </p>
+            )}
+          </div>
+        )}
+
         {task.description && (
           <pre className="whitespace-pre-wrap rounded-xl bg-black/30 p-3 text-sm text-ink-300">
 {task.description}
