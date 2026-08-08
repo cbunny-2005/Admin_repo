@@ -42,3 +42,19 @@ body::before {
 
 @keyframes rise { from { opacity:0; transform: translateY(6px); } to { opacity:1; transform:none; } }
 .rise { animation: rise .28s cubic-bezier(.22,.68,0,1) both; }
+
+/* Chrome/Edge draw the native date-picker button as a DARK glyph, which is invisible
+   on a dark input — the field looks like it has no calendar at all and the only way
+   to open the picker is to guess where to click. Inverting makes it light. Firefox has
+   no such button and ignores this selector. */
+input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+input[type="date"]::-webkit-calendar-picker-indicator,
+input[type="time"]::-webkit-calendar-picker-indicator {
+  filter: invert(1) opacity(0.65);
+  cursor: pointer;
+}
+input[type="datetime-local"]::-webkit-calendar-picker-indicator:hover,
+input[type="date"]::-webkit-calendar-picker-indicator:hover,
+input[type="time"]::-webkit-calendar-picker-indicator:hover {
+  filter: invert(1) opacity(1);
+}
