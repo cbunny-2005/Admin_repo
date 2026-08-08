@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, Phone, PhoneOff } from 'lucide-react'
 import { LiveVoice, type Phase, type Timings } from './lib/liveVoice'
-import { Card, ErrorBox, cx } from './ui'
+import { Card, ErrorBox, Field, cx, inputCls } from './ui'
 
 /**
  * Live Voice — SPIKE. Hold a conversation; no button between turns.
@@ -37,6 +37,8 @@ export function Voice() {
   const [t, setT] = useState<Timings>({})
   const [error, setError] = useState<string | null>(null)
   const [log, setLog] = useState<Timings[]>([])
+  // 7 by default — the account this spike is exercised with.
+  const [userId, setUserId] = useState('7')
 
   const engine = useRef<LiveVoice | null>(null)
 
@@ -64,10 +66,10 @@ export function Voice() {
         if (nt.audioMs !== undefined) setLog(l => [nt, ...l].slice(0, 6))
       },
       onError: setError,
-    })
+    }, Number(userId) || 7)
     engine.current = lv
     await lv.start()
-  }, [])
+  }, [userId])
 
   const live = phase !== 'idle'
   // The orb breathes with mic level while listening and pulses on its own otherwise,
@@ -78,6 +80,14 @@ export function Voice() {
     <div className="space-y-6">
       <Card className="p-8 rise">
         <div className="flex flex-col items-center gap-6">
+          <div className="flex items-end gap-4">
+            <Field label="Ask as user id">
+              <input
+                className={inputCls} value={userId} inputMode="numeric" disabled={live}
+                onChange={e => setUserId(e.target.value.replace(/\D/g, ''))}
+              />
+            </Field>
+          </div>
           <button
             onClick={toggle}
             aria-label={live ? 'End call' : 'Start call'}
@@ -112,7 +122,7 @@ export function Voice() {
           <div className="text-center">
             <div className="text-sm font-semibold">{PHASE_COPY[phase]}</div>
             <div className="mt-1 h-5 text-sm text-ink-600">
-              {partial || (phase === 'idle' ? 'Local spike server — nothing is saved' : '')}
+              {partial || (phase === 'idle' ? `Local backend · POST /chat as user ${userId}` : '')}
             </div>
           </div>
 
@@ -177,9 +187,10 @@ export function Voice() {
 
       <p className="flex items-start gap-2 text-xs text-ink-600">
         <AlertTriangle className="mt-px size-3.5 shrink-0 text-amber-500" />
-        Spike. Speech goes straight from this browser to Sarvam; the reply comes from
-        the local spike server on :8099, not production /chat. Nothing is persisted and
-        no notification is sent.
+        Spike. Speech goes browser → Sarvam directly. The reply comes from the LOCAL
+        backend's real <code>POST /chat</code> — the full Oscar agent — so it DOES write
+        to that user's chat history and push to their device. Because /chat returns one
+        body rather than tokens, &quot;first token&quot; is when the whole answer lands.
       </p>
     </div>
   )

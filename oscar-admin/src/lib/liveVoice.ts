@@ -22,8 +22,17 @@
  */
 
 const KEY = import.meta.env.VITE_SARVAM_KEY as string | undefined
-const LLM_URL = (import.meta.env.VITE_SPIKE_LLM_URL as string | undefined)
-  ?? 'http://127.0.0.1:8099/spike/llm/oscar'
+
+/** The reply endpoint. Defaults to the REAL local `/chat` — the actual Oscar brain,
+ *  tools and all — so the latency measured is the one a user would live with, not a
+ *  stripped-down floor. Point it at /spike/llm/oscar to measure that floor instead. */
+const LLM_URL = (import.meta.env.VITE_CHAT_URL as string | undefined)
+  ?? 'http://127.0.0.1:8000/chat'
+const DEFAULT_USER_ID = Number(import.meta.env.VITE_CHAT_USER_ID ?? 7)
+
+/** `/chat` answers with ONE JSON body; `/spike/llm/*` streams SSE tokens. Detected
+ *  from the URL so both work without a second flag to keep in sync. */
+const isSse = (u: string) => u.includes('/spike/')
 
 const STT_WS = 'wss://api.sarvam.ai/speech-to-text-realtime/ws'
 const TTS_WS = 'wss://api.sarvam.ai/text-to-speech/ws'
@@ -32,6 +41,10 @@ const FRAME_MS = 100
 const TARGET_SR = 16000
 /** 400 ms measured as the floor: at 200 ms the VAD ends the utterance mid-sentence. */
 const SILENCE_MS = 400
+/** How long the TTS socket must be quiet before we treat the reply as fully
+ *  synthesised. Chunks arrive ~32 ms apart, so 250 ms is comfortably past the gap
+ *  without adding noticeable delay before playback starts. */
+const IDLE_MS = 250
 
 export type Phase = 'idle' | 'listening' | 'thinking' | 'speaking'
 
@@ -78,6 +91,7 @@ function b64(bytes: Int16Array): string {
 
 export class LiveVoice {
   private h: Handlers
+  private userId: number
   private stt?: WebSocket
   private tts?: WebSocket
   private ctx?: AudioContext
@@ -91,14 +105,25 @@ export class LiveVoice {
   private reply = ''
   private spokenFirst = false
 
-  // Playback queue. Sarvam streams MP3 chunks; decoding each one standalone is not
-  // reliable mid-stream, so they are concatenated and played as one blob per
-  // sentence. First-audio latency is preserved because the FIRST sentence is sent
-  // to TTS the moment it exists.
+  // Playback. Sarvam streams MP3 chunks; decoding one standalone mid-stream is not
+  // reliable, so they are concatenated and played as a blob.
+  //
+  // 🔴 There is NO completion message. Verified against the live socket: 18 audio
+  // chunks arrive and then nothing — no `flush` echo, no `audio.complete`, the
+  // socket just goes quiet. Waiting for one (the obvious reading of the API) means
+  // audio accumulates forever and the user hears silence, which is exactly how this
+  // first failed. End-of-speech is therefore detected by IDLE: no new chunk for
+  // IDLE_MS. Queued so a second batch cannot cut off the first.
   private audioChunks: Uint8Array[] = []
+  private idleTimer: number | undefined
+  private playQueue: string[] = []
+  private playing = false
   private audioEl = new Audio()
 
-  constructor(h: Handlers) { this.h = h }
+  constructor(h: Handlers, userId: number = DEFAULT_USER_ID) {
+    this.h = h
+    this.userId = userId
+  }
 
   get isRunning() { return this.running }
 
@@ -125,7 +150,11 @@ export class LiveVoice {
     try { this.ctx?.close() } catch { /* ditto */ }
     try { this.stt?.close() } catch { /* ditto */ }
     try { this.tts?.close() } catch { /* ditto */ }
+    if (this.idleTimer) clearTimeout(this.idleTimer)
     this.audioEl.pause()
+    this.playQueue.forEach(URL.revokeObjectURL)
+    this.playQueue = []
+    this.playing = false
     this.h.onLevel(0)
     this.h.onPhase('idle')
   }
@@ -224,22 +253,39 @@ export class LiveVoice {
       const u8 = new Uint8Array(bin.length)
       for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i)
       this.audioChunks.push(u8)
+      // Restart the idle countdown on every chunk — it fires once the server stops.
+      if (this.idleTimer) clearTimeout(this.idleTimer)
+      this.idleTimer = setTimeout(() => this.flushAudio(), IDLE_MS) as unknown as number
     }
-    if ((m.type ?? m.event) === 'flush' || m.event === 'audio.complete') this.playQueued()
   }
 
-  private playQueued() {
-    if (!this.audioChunks.length) { this.h.onPhase('listening'); return }
+  /** The server has gone quiet — turn what arrived into one playable blob. */
+  private flushAudio() {
+    if (!this.audioChunks.length) return
     const blob = new Blob(this.audioChunks as BlobPart[], { type: 'audio/mpeg' })
     this.audioChunks = []
-    const url = URL.createObjectURL(blob)
-    this.audioEl.src = url
-    this.audioEl.onended = () => {
-      URL.revokeObjectURL(url)
+    this.playQueue.push(URL.createObjectURL(blob))
+    if (!this.playing) this.playNext()
+  }
+
+  private playNext() {
+    const url = this.playQueue.shift()
+    if (!url) {
+      this.playing = false
       // Straight back to listening — that continuity IS the live-voice feel.
       if (this.running) this.h.onPhase('listening')
+      return
     }
-    void this.audioEl.play().catch(() => this.h.onPhase('listening'))
+    this.playing = true
+    this.audioEl.src = url
+    this.audioEl.onended = () => { URL.revokeObjectURL(url); this.playNext() }
+    this.audioEl.onerror = () => { URL.revokeObjectURL(url); this.playNext() }
+    void this.audioEl.play().catch(e => {
+      // Autoplay policy: the first sound of a session can need a user gesture. Say
+      // so instead of failing silently, which is indistinguishable from a dead TTS.
+      this.h.onError(`Audio blocked by the browser (${(e as Error).name}) — click the page once.`)
+      this.playNext()
+    })
   }
 
   // ── LLM ───────────────────────────────────────────────────────────────────
@@ -253,38 +299,13 @@ export class LiveVoice {
       const res = await fetch(LLM_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ user_id: this.userId, message: text }),
       })
-      if (!res.body) throw new Error('no stream from the LLM endpoint')
-      const reader = res.body.getReader()
-      const dec = new TextDecoder()
-      let buf = ''
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += dec.decode(value, { stream: true })
-        const lines = buf.split('\n')
-        buf = lines.pop() ?? ''
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          let d: any
-          try { d = JSON.parse(line.slice(6)) } catch { continue }
-          if (d.t) {
-            if (this.t.llmMs === undefined) {
-              this.t.llmMs = Math.round(performance.now() - this.speechEndAt)
-              this.h.onTimings({ ...this.t })
-            }
-            this.reply += d.t
-            this.h.onReplyToken(this.reply)
-            // Sentence one goes to the speaker immediately.
-            if (!this.spokenFirst) {
-              const m = /[.!?]\s/.exec(this.reply)
-              if (m) { this.speak(this.reply.slice(0, m.index + 1)); this.spokenFirst = true }
-            }
-          }
-        }
-      }
-      // Short answers with no sentence break still have to be spoken.
+      if (!res.ok) throw new Error(`${LLM_URL} -> HTTP ${res.status}`)
+
+      if (isSse(LLM_URL)) await this.readSse(res)
+      else await this.readJson(res)
+
       if (!this.spokenFirst && this.reply.trim()) this.speak(this.reply)
       else if (this.spokenFirst) {
         const m = /[.!?]\s/.exec(this.reply)
@@ -294,7 +315,52 @@ export class LiveVoice {
       this.tts?.send(JSON.stringify({ type: 'flush' }))
     } catch (e) {
       this.h.onError((e as Error).message)
+      // Back to listening rather than stuck on "Thinking…" — a dead reply must not
+      // strand the call, which is exactly how a 404 presented before.
       this.h.onPhase('listening')
+    }
+  }
+
+  /** `POST /chat` — the real assistant. One body, no tokens, so "first token" and
+   *  "reply complete" are the same instant. That is the honest number for this
+   *  endpoint: nothing can be spoken until the whole answer exists. */
+  private async readJson(res: Response) {
+    const d = await res.json()
+    this.t.llmMs = Math.round(performance.now() - this.speechEndAt)
+    this.h.onTimings({ ...this.t })
+    this.reply = (d.response ?? '').toString()
+    this.h.onReplyToken(this.reply)
+  }
+
+  /** `POST /spike/llm/*` — SSE tokens, so sentence one can be spoken while the rest
+   *  is still being written. */
+  private async readSse(res: Response) {
+    if (!res.body) throw new Error('no stream from the LLM endpoint')
+    const reader = res.body.getReader()
+    const dec = new TextDecoder()
+    let buf = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += dec.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        let d: any
+        try { d = JSON.parse(line.slice(6)) } catch { continue }
+        if (!d.t) continue
+        if (this.t.llmMs === undefined) {
+          this.t.llmMs = Math.round(performance.now() - this.speechEndAt)
+          this.h.onTimings({ ...this.t })
+        }
+        this.reply += d.t
+        this.h.onReplyToken(this.reply)
+        if (!this.spokenFirst) {
+          const m = /[.!?]\s/.exec(this.reply)
+          if (m) { this.speak(this.reply.slice(0, m.index + 1)); this.spokenFirst = true }
+        }
+      }
     }
   }
 
