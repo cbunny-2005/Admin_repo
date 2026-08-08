@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, Phone, PhoneOff } from 'lucide-react'
-import { LiveVoice, type Phase, type Timings } from './lib/liveVoice'
+import { LiveVoice, SPEAKERS, type Phase, type Timings } from './lib/liveVoice'
 import { Card, ErrorBox, Field, cx, inputCls } from './ui'
 
 /**
@@ -37,8 +37,11 @@ export function Voice() {
   const [t, setT] = useState<Timings>({})
   const [error, setError] = useState<string | null>(null)
   const [log, setLog] = useState<Timings[]>([])
-  // 7 by default — the account this spike is exercised with.
-  const [userId, setUserId] = useState('7')
+  // 90 = Vijender, the person running this panel. Defaulting to anyone ELSE means
+  // every spoken turn writes into a real colleague's chat history and pushes to
+  // their phone — which is exactly what happened with 7 (Sathvik).
+  const [userId, setUserId] = useState('90')
+  const [speaker, setSpeaker] = useState('dev')
 
   const engine = useRef<LiveVoice | null>(null)
 
@@ -66,10 +69,10 @@ export function Voice() {
         if (nt.audioMs !== undefined) setLog(l => [nt, ...l].slice(0, 6))
       },
       onError: setError,
-    }, Number(userId) || 7)
+    }, Number(userId) || 90, speaker)
     engine.current = lv
     await lv.start()
-  }, [userId])
+  }, [userId, speaker])
 
   const live = phase !== 'idle'
   // The orb breathes with mic level while listening and pulses on its own otherwise,
@@ -86,6 +89,12 @@ export function Voice() {
                 className={inputCls} value={userId} inputMode="numeric" disabled={live}
                 onChange={e => setUserId(e.target.value.replace(/\D/g, ''))}
               />
+            </Field>
+            <Field label="Voice">
+              <select className={inputCls} value={speaker} disabled={live}
+                      onChange={e => setSpeaker(e.target.value)}>
+                {SPEAKERS.map(sp => <option key={sp} value={sp}>{sp}</option>)}
+              </select>
             </Field>
           </div>
           <button

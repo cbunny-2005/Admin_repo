@@ -23,16 +23,21 @@
 
 const KEY = import.meta.env.VITE_SARVAM_KEY as string | undefined
 
-/** The reply endpoint. Defaults to the REAL local `/chat` — the actual Oscar brain,
- *  tools and all — so the latency measured is the one a user would live with, not a
- *  stripped-down floor. Point it at /spike/llm/oscar to measure that floor instead. */
-const LLM_URL = (import.meta.env.VITE_CHAT_URL as string | undefined)
-  ?? 'http://127.0.0.1:8000/chat'
-const DEFAULT_USER_ID = Number(import.meta.env.VITE_CHAT_USER_ID ?? 7)
-
-/** `/chat` answers with ONE JSON body; `/spike/llm/*` streams SSE tokens. Detected
- *  from the URL so both work without a second flag to keep in sync. */
-const isSse = (u: string) => u.includes('/spike/')
+/** The REAL backend. `/chat/stream` is used, not `/chat`: it streams the agent's
+ *  tokens over the WebSocket the client already holds, so the first sentence can be
+ *  spoken while the model is still writing the rest. `/chat` returns one complete
+ *  body, which forces a full wait before any sound — the thing this spike exists to
+ *  avoid. Same agent either way; only the delivery differs. */
+const BASE = (import.meta.env.VITE_BACKEND_URL as string | undefined)
+  ?? 'http://127.0.0.1:8000'
+const DEFAULT_USER_ID = Number(import.meta.env.VITE_CHAT_USER_ID ?? 90)
+/** bulbul:v3 voice. Sarvam ships 44; these are the ones worth trying first for an
+ *  English-India assistant. `dev` is the default. */
+export const SPEAKERS = [
+  'dev', 'shubh', 'karun', 'hitesh', 'abhilash', 'rahul', 'amit', 'varun',
+  'anushka', 'manisha', 'vidya', 'arya', 'priya', 'neha', 'kavya', 'shreya',
+]
+const DEFAULT_SPEAKER = (import.meta.env.VITE_SARVAM_SPEAKER as string) ?? 'dev'
 
 const STT_WS = 'wss://api.sarvam.ai/speech-to-text-realtime/ws'
 const TTS_WS = 'wss://api.sarvam.ai/text-to-speech/ws'
@@ -92,37 +97,56 @@ function b64(bytes: Int16Array): string {
 export class LiveVoice {
   private h: Handlers
   private userId: number
+  private speaker: string
   private stt?: WebSocket
   private tts?: WebSocket
+  private appWs?: WebSocket
   private ctx?: AudioContext
   private stream?: MediaStream
   private node?: ScriptProcessorNode
   private pending: number[] = []
   private running = false
 
+  /** This call's own conversation. Without it every turn lands in the AMBIENT
+   *  history bucket (session_id = null), which `_history_messages` shows to EVERY
+   *  conversation — so a photo sent from the phone a minute earlier leaked into a
+   *  spoken "Hey hi" and Oscar answered "Got the image — what would you like me to
+   *  do with it?". Opening a session scopes this call to itself. */
+  private sessionId?: number
+
   private speechEndAt = 0
   private t: Timings = {}
   private reply = ''
   private spokenFirst = false
 
-  // Playback. Sarvam streams MP3 chunks; decoding one standalone mid-stream is not
-  // reliable, so they are concatenated and played as a blob.
+  // Playback via MediaSource — chunks are appended and PLAY IMMEDIATELY.
   //
-  // 🔴 There is NO completion message. Verified against the live socket: 18 audio
-  // chunks arrive and then nothing — no `flush` echo, no `audio.complete`, the
-  // socket just goes quiet. Waiting for one (the obvious reading of the API) means
-  // audio accumulates forever and the user hears silence, which is exactly how this
-  // first failed. End-of-speech is therefore detected by IDLE: no new chunk for
-  // IDLE_MS. Queued so a second batch cannot cut off the first.
-  private audioChunks: Uint8Array[] = []
+  // The first version concatenated every chunk into one blob and played it after
+  // the socket went quiet. That is correct and feels broken: it converts a stream
+  // into a batch, so nothing is heard until the ENTIRE sentence has synthesised —
+  // roughly a second of silence while the text was already on screen. "Text fast,
+  // voice slow" is exactly what that looks like.
+  //
+  // MSE appends each MP3 chunk to a live buffer, so audio starts on chunk ONE
+  // (~200 ms) and the rest arrives while it is already speaking. Falls back to the
+  // blob path where MSE cannot take audio/mpeg (Safari), because slow audio still
+  // beats no audio.
+  private media?: MediaSource
+  private sb?: SourceBuffer
+  private appendQ: Uint8Array[] = []
+  private mseReady = false
+  private audioChunks: Uint8Array[] = []   // fallback path only
   private idleTimer: number | undefined
-  private playQueue: string[] = []
-  private playing = false
   private audioEl = new Audio()
+  private audioWired = false
+  private useMse = typeof MediaSource !== 'undefined'
+    && MediaSource.isTypeSupported('audio/mpeg')
 
-  constructor(h: Handlers, userId: number = DEFAULT_USER_ID) {
+  constructor(h: Handlers, userId: number = DEFAULT_USER_ID,
+              speaker: string = DEFAULT_SPEAKER) {
     this.h = h
     this.userId = userId
+    this.speaker = speaker
   }
 
   get isRunning() { return this.running }
@@ -133,6 +157,8 @@ export class LiveVoice {
     this.running = true
     try {
       await this.openTts()
+      await this.openApp()
+      await this.openSession()
       await this.openStt()
       await this.openMic()
       this.h.onPhase('listening')
@@ -149,12 +175,11 @@ export class LiveVoice {
     try { this.stream?.getTracks().forEach(t => t.stop()) } catch { /* ditto */ }
     try { this.ctx?.close() } catch { /* ditto */ }
     try { this.stt?.close() } catch { /* ditto */ }
+    try { this.appWs?.close() } catch { /* ditto */ }
     try { this.tts?.close() } catch { /* ditto */ }
     if (this.idleTimer) clearTimeout(this.idleTimer)
     this.audioEl.pause()
-    this.playQueue.forEach(URL.revokeObjectURL)
-    this.playQueue = []
-    this.playing = false
+    this.resetAudio()
     this.h.onLevel(0)
     this.h.onPhase('idle')
   }
@@ -164,6 +189,43 @@ export class LiveVoice {
   private sub(): string[] {
     // The subprotocol IS the credential — see the header note at the top.
     return [`api-subscription-key.${KEY}`]
+  }
+
+  /** The app's own socket. /chat/stream refuses to generate at all unless this user
+   *  has one open — the backend short-circuits rather than bill a reply nobody can
+   *  see — so it must be connected BEFORE the first question is asked. */
+  private openApp(): Promise<void> {
+    const url = BASE.replace(/^http/, 'ws') + `/ws?user_id=${this.userId}`
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(url)
+      this.appWs = ws
+      ws.onopen = () => resolve()
+      ws.onerror = () => reject(new Error(`app socket failed: ${url}`))
+      ws.onmessage = e => {
+        // The server pings every 30 s and closes with 4002 if we never pong.
+        try {
+          const f = JSON.parse(e.data)
+          if (f.type === 'connection.ping') {
+            ws.send(JSON.stringify({ type: 'connection.pong' }))
+            return
+          }
+        } catch { /* non-JSON frames are ignored by contract */ }
+        this.onAppFrame(e)
+      }
+    })
+  }
+
+  /** Best-effort: if the backend predates sessions, carry on without one rather
+   *  than refuse to start a call. */
+  private async openSession() {
+    try {
+      const r = await fetch(`${BASE}/chat/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: this.userId, title: 'Live voice (spike)' }),
+      })
+      if (r.ok) this.sessionId = (await r.json()).session_id
+    } catch { /* no session — turns fall back to ambient, as before */ }
   }
 
   private openStt(): Promise<void> {
@@ -200,7 +262,7 @@ export class LiveVoice {
         ws.send(JSON.stringify({
           type: 'config',
           data: {
-            target_language_code: 'en-IN', speaker: 'shubh',
+            target_language_code: 'en-IN', speaker: this.speaker,
             output_audio_codec: 'mp3', speech_sample_rate: 22050,
             min_buffer_size: 50, max_chunk_length: 150,
           },
@@ -252,39 +314,107 @@ export class LiveVoice {
       const bin = atob(b)
       const u8 = new Uint8Array(bin.length)
       for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i)
-      this.audioChunks.push(u8)
-      // Restart the idle countdown on every chunk — it fires once the server stops.
-      if (this.idleTimer) clearTimeout(this.idleTimer)
-      this.idleTimer = setTimeout(() => this.flushAudio(), IDLE_MS) as unknown as number
+      if (this.useMse) {
+        this.pushMse(u8)
+        // Sarvam sends no completion event, so end-of-reply is still detected by
+        // idle — but here it only CLOSES the buffer; playback already started on
+        // chunk one, so this costs nothing.
+        if (this.idleTimer) clearTimeout(this.idleTimer)
+        this.idleTimer = setTimeout(() => this.endMse(), IDLE_MS) as unknown as number
+      } else {
+        this.audioChunks.push(u8)
+        if (this.idleTimer) clearTimeout(this.idleTimer)
+        this.idleTimer = setTimeout(() => this.flushAudio(), IDLE_MS) as unknown as number
+      }
     }
   }
 
-  /** The server has gone quiet — turn what arrived into one playable blob. */
+  /** Open a fresh MediaSource for this reply and start playing the moment the
+   *  first bytes land. */
+  private startMse() {
+    if (!this.audioWired) {
+      // One listener for the life of the engine — re-adding per reply would stack
+      // handlers and fire the phase change N times.
+      this.audioEl.addEventListener('ended', () => {
+        this.resetAudio()
+        if (this.running) this.h.onPhase('listening')
+      })
+      this.audioWired = true
+    }
+    const ms = new MediaSource()
+    this.media = ms
+    this.mseReady = false
+    this.appendQ = []
+    this.audioEl.src = URL.createObjectURL(ms)
+    ms.addEventListener('sourceopen', () => {
+      try {
+        const sb = ms.addSourceBuffer('audio/mpeg')
+        this.sb = sb
+        sb.addEventListener('updateend', () => this.drainQ())
+        this.mseReady = true
+        this.drainQ()
+      } catch {
+        // Codec refused after all — fall back rather than go silent.
+        this.useMse = false
+      }
+    })
+    void this.audioEl.play().catch(e => {
+      this.h.onError(`Audio blocked by the browser (${(e as Error).name}) — click the page once.`)
+    })
+  }
+
+  /** Tear down the current reply's buffer so the next turn starts clean. */
+  private resetAudio() {
+    try { this.media && this.media.readyState === 'open' && this.media.endOfStream() } catch { /* fine */ }
+    this.media = undefined
+    this.sb = undefined
+    this.appendQ = []
+    this.audioChunks = []
+    this.mseReady = false
+  }
+
+  private pushMse(u8: Uint8Array) {
+    if (!this.media) this.startMse()
+    this.appendQ.push(u8)
+    this.drainQ()
+  }
+
+  /** A SourceBuffer accepts one append at a time; queue the rest. */
+  private drainQ() {
+    if (!this.mseReady || !this.sb || this.sb.updating) return
+    const next = this.appendQ.shift()
+    if (!next) return
+    try {
+      this.sb.appendBuffer(next as unknown as BufferSource)
+    } catch {
+      this.appendQ.unshift(next)
+    }
+  }
+
+  /** The reply is fully synthesised — close the stream so `ended` fires and the
+   *  call returns to listening. */
+  private endMse() {
+    if (!this.media || this.media.readyState !== 'open') return
+    const finish = () => {
+      try { this.media?.endOfStream() } catch { /* already ended */ }
+    }
+    if (this.sb?.updating || this.appendQ.length) setTimeout(() => this.endMse(), 60)
+    else finish()
+  }
+
+  /** Fallback only: no MSE, so play what accumulated once the socket goes quiet. */
   private flushAudio() {
     if (!this.audioChunks.length) return
     const blob = new Blob(this.audioChunks as BlobPart[], { type: 'audio/mpeg' })
     this.audioChunks = []
-    this.playQueue.push(URL.createObjectURL(blob))
-    if (!this.playing) this.playNext()
-  }
-
-  private playNext() {
-    const url = this.playQueue.shift()
-    if (!url) {
-      this.playing = false
-      // Straight back to listening — that continuity IS the live-voice feel.
-      if (this.running) this.h.onPhase('listening')
-      return
-    }
-    this.playing = true
+    const url = URL.createObjectURL(blob)
     this.audioEl.src = url
-    this.audioEl.onended = () => { URL.revokeObjectURL(url); this.playNext() }
-    this.audioEl.onerror = () => { URL.revokeObjectURL(url); this.playNext() }
+    this.audioEl.onended = () => {
+      URL.revokeObjectURL(url)
+      if (this.running) this.h.onPhase('listening')
+    }
     void this.audioEl.play().catch(e => {
-      // Autoplay policy: the first sound of a session can need a user gesture. Say
-      // so instead of failing silently, which is indistinguishable from a dead TTS.
       this.h.onError(`Audio blocked by the browser (${(e as Error).name}) — click the page once.`)
-      this.playNext()
     })
   }
 
@@ -296,70 +426,74 @@ export class LiveVoice {
     this.t.llmMs = undefined
     this.t.audioMs = undefined
     try {
-      const res = await fetch(LLM_URL, {
+      // POST only STARTS the run; the answer arrives on the app socket. A
+      // `streaming:false` reply means the backend saw no live socket for this user
+      // and generated nothing — worth surfacing rather than waiting forever.
+      const res = await fetch(`${BASE}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: this.userId, message: text }),
+        body: JSON.stringify({
+          user_id: this.userId, message: text, voice: true,
+          ...(this.sessionId ? { session_id: this.sessionId } : {}),
+        }),
       })
-      if (!res.ok) throw new Error(`${LLM_URL} -> HTTP ${res.status}`)
-
-      if (isSse(LLM_URL)) await this.readSse(res)
-      else await this.readJson(res)
-
-      if (!this.spokenFirst && this.reply.trim()) this.speak(this.reply)
-      else if (this.spokenFirst) {
-        const m = /[.!?]\s/.exec(this.reply)
-        const rest = m ? this.reply.slice(m.index + 1).trim() : ''
-        if (rest) this.tts?.send(JSON.stringify({ type: 'text', data: { text: rest } }))
+      if (!res.ok) throw new Error(`/chat/stream -> HTTP ${res.status}`)
+      const d = await res.json()
+      if (d.streaming === false) {
+        throw new Error(`backend declined to stream (${d.reason ?? 'no socket'})`)
       }
-      this.tts?.send(JSON.stringify({ type: 'flush' }))
     } catch (e) {
       this.h.onError((e as Error).message)
-      // Back to listening rather than stuck on "Thinking…" — a dead reply must not
-      // strand the call, which is exactly how a 404 presented before.
       this.h.onPhase('listening')
     }
   }
 
-  /** `POST /chat` — the real assistant. One body, no tokens, so "first token" and
-   *  "reply complete" are the same instant. That is the honest number for this
-   *  endpoint: nothing can be spoken until the whole answer exists. */
-  private async readJson(res: Response) {
-    const d = await res.json()
-    this.t.llmMs = Math.round(performance.now() - this.speechEndAt)
-    this.h.onTimings({ ...this.t })
-    this.reply = (d.response ?? '').toString()
-    this.h.onReplyToken(this.reply)
-  }
-
-  /** `POST /spike/llm/*` — SSE tokens, so sentence one can be spoken while the rest
-   *  is still being written. */
-  private async readSse(res: Response) {
-    if (!res.body) throw new Error('no stream from the LLM endpoint')
-    const reader = res.body.getReader()
-    const dec = new TextDecoder()
-    let buf = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += dec.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue
-        let d: any
-        try { d = JSON.parse(line.slice(6)) } catch { continue }
-        if (!d.t) continue
+  /** Frames from the app's own WebSocket — the same ones the Flutter client gets.
+   *
+   *  chat.delta is prose only: a structured (JSON) answer and every fast-path reply
+   *  emit NO deltas, just chat.complete. So this must never assume deltas arrive, or
+   *  greetings and "what's due today" would be silent — the two most common things
+   *  anyone says to it.
+   */
+  private onAppFrame(ev: MessageEvent) {
+    let f: any
+    try { f = JSON.parse(ev.data) } catch { return }
+    const p = f.payload ?? {}
+    switch (f.type) {
+      case 'chat.delta': {
+        if (!p.text) return
         if (this.t.llmMs === undefined) {
           this.t.llmMs = Math.round(performance.now() - this.speechEndAt)
           this.h.onTimings({ ...this.t })
         }
-        this.reply += d.t
+        this.reply += p.text
         this.h.onReplyToken(this.reply)
+        // Sentence one to the speaker while the model keeps writing.
         if (!this.spokenFirst) {
           const m = /[.!?]\s/.exec(this.reply)
           if (m) { this.speak(this.reply.slice(0, m.index + 1)); this.spokenFirst = true }
         }
+        break
+      }
+      case 'chat.complete': {
+        // chat.complete.text is AUTHORITATIVE and replaces the buffer — that is the
+        // documented contract, and it is how a fast-path reply (zero deltas) arrives.
+        const full = (p.text ?? '').toString()
+        if (this.t.llmMs === undefined) {
+          this.t.llmMs = Math.round(performance.now() - this.speechEndAt)
+          this.h.onTimings({ ...this.t })
+        }
+        this.reply = full
+        this.h.onReplyToken(full)
+        if (!this.spokenFirst) {
+          if (full.trim()) this.speak(full)
+        } else {
+          const m = /[.!?]\s/.exec(full)
+          const rest = m ? full.slice(m.index + 1).trim() : ''
+          if (rest) this.speak(rest)
+        }
+        this.tts?.send(JSON.stringify({ type: 'flush' }))
+        break
       }
     }
   }
