@@ -44,8 +44,38 @@ const TTS_WS = 'wss://api.sarvam.ai/text-to-speech/ws'
 
 const FRAME_MS = 100
 const TARGET_SR = 16000
-/** 400 ms measured as the floor: at 200 ms the VAD ends the utterance mid-sentence. */
-const SILENCE_MS = 400
+/** How much silence ends your turn.
+ *
+ *  🔴 NOT tuned for latency, and 400 was a mistake. 400 ms is the floor a CLIP can
+ *  survive, but a person pausing to think mid-sentence is silent for longer than
+ *  that — so "assign task to Sriram … regarding … the TTS event" arrived as three
+ *  separate questions and Oscar answered each with "could you clarify?". The
+ *  transcript in the logs is a conversation cut into confetti.
+ *
+ *  800 ms costs 400 ms of latency and buys back whole sentences. Coherence beats
+ *  speed: a fast answer to half a sentence is not an answer. */
+const SILENCE_MS = Number(import.meta.env.VITE_VAD_SILENCE_MS ?? 800)
+/** The first point in a growing reply worth speaking.
+ *
+ *  The obvious /[.!?]\s/ is WRONG and cost the whole benefit of streaming: it needs
+ *  whitespace AFTER the punctuation, so a one-sentence reply — "Understood!", "Got
+ *  it! What next?" — never matched and nothing was spoken until the model finished.
+ *  Most replies are one sentence, so streaming was effectively off.
+ *
+ *  Now: end of a sentence anywhere (trailing punctuation counts), or a clause break
+ *  once there is enough to be worth saying. MIN_SPEAK_CHARS stops us shipping "I"
+ *  or "Done," as a standalone utterance, which sounds worse than waiting. */
+const MIN_SPEAK_CHARS = 24
+function firstChunkEnd(s: string): number {
+  const sentence = /[.!?](\s|$)/.exec(s)
+  if (sentence && sentence.index + 1 >= MIN_SPEAK_CHARS) return sentence.index + 1
+  if (s.length >= MIN_SPEAK_CHARS) {
+    const clause = /[,;:—]\s/.exec(s.slice(MIN_SPEAK_CHARS))
+    if (clause) return MIN_SPEAK_CHARS + clause.index + 1
+  }
+  return -1
+}
+
 /** How long the TTS socket must be quiet before we treat the reply as fully
  *  synthesised. Chunks arrive ~32 ms apart, so 250 ms is comfortably past the gap
  *  without adding noticeable delay before playback starts. */
@@ -114,6 +144,17 @@ export class LiveVoice {
    *  do with it?". Opening a session scopes this call to itself. */
   private sessionId?: number
 
+  /** A turn is in flight. Sending another while one is running is what broke the
+   *  conversation: history is only written when a turn COMPLETES (agent.py pushes
+   *  at the end), so a second turn starting 0.6 s later reads an empty history and
+   *  has no idea what was just asked. That is why "assign a task to Sriram" →
+   *  "what time?" → "11 AM today" → "clarify what you'd like to schedule at 11 AM".
+   *  Overlapping turns also race on the server's per-user turn context. */
+  private busy = false
+  /** Speech that arrived while busy — merged into ONE message rather than dropped,
+   *  because the fragments are usually halves of the same sentence. */
+  private queued: string[] = []
+
   private speechEndAt = 0
   private t: Timings = {}
   private reply = ''
@@ -171,6 +212,8 @@ export class LiveVoice {
 
   stop() {
     this.running = false
+    this.busy = false
+    this.queued = []
     try { this.node?.disconnect() } catch { /* already gone */ }
     try { this.stream?.getTracks().forEach(t => t.stop()) } catch { /* ditto */ }
     try { this.ctx?.close() } catch { /* ditto */ }
@@ -288,7 +331,14 @@ export class LiveVoice {
         break
       case 'transcript.final': {
         const text = (m.text ?? m.transcript ?? '').trim()
-        if (!text) { this.h.onPhase('listening'); return }
+        if (!text) { if (!this.busy) this.h.onPhase('listening'); return }
+        if (this.busy) {
+          // Still answering the previous fragment — hold this one and send it as
+          // part of the next message instead of racing.
+          this.queued.push(text)
+          this.h.onFinal([...this.queued].join(' '))
+          return
+        }
         this.t = { sttMs: Math.round(performance.now() - this.speechEndAt) }
         this.h.onTimings(this.t)
         this.h.onFinal(text)
@@ -421,6 +471,12 @@ export class LiveVoice {
   // ── LLM ───────────────────────────────────────────────────────────────────
 
   private async ask(text: string) {
+    // Anything buffered while the last turn ran belongs with this one.
+    if (this.queued.length) {
+      text = [...this.queued, text].join(' ')
+      this.queued = []
+    }
+    this.busy = true
     this.reply = ''
     this.spokenFirst = false
     this.t.llmMs = undefined
@@ -443,6 +499,7 @@ export class LiveVoice {
         throw new Error(`backend declined to stream (${d.reason ?? 'no socket'})`)
       }
     } catch (e) {
+      this.busy = false
       this.h.onError((e as Error).message)
       this.h.onPhase('listening')
     }
@@ -470,8 +527,8 @@ export class LiveVoice {
         this.h.onReplyToken(this.reply)
         // Sentence one to the speaker while the model keeps writing.
         if (!this.spokenFirst) {
-          const m = /[.!?]\s/.exec(this.reply)
-          if (m) { this.speak(this.reply.slice(0, m.index + 1)); this.spokenFirst = true }
+          const cut = firstChunkEnd(this.reply)
+          if (cut > 0) { this.speak(this.reply.slice(0, cut)); this.spokenFirst = true }
         }
         break
       }
@@ -488,14 +545,37 @@ export class LiveVoice {
         if (!this.spokenFirst) {
           if (full.trim()) this.speak(full)
         } else {
-          const m = /[.!?]\s/.exec(full)
-          const rest = m ? full.slice(m.index + 1).trim() : ''
+          const cut = firstChunkEnd(full)
+          const rest = cut > 0 ? full.slice(cut).trim() : ''
           if (rest) this.speak(rest)
         }
         this.tts?.send(JSON.stringify({ type: 'flush' }))
+        this.turnDone()
         break
       }
     }
+  }
+
+  /** The turn is over: the server has now written this exchange to history, so the
+   *  NEXT message will actually see it. Anything the user said while we were busy
+   *  goes out as a single merged message. */
+  private turnDone() {
+    this.busy = false
+    if (this.queued.length) {
+      const merged = this.queued.join(' ')
+      this.queued = []
+      void this.ask(merged)
+    }
+  }
+
+  /** Start a fresh conversation without dropping the call — new session id, so the
+   *  agent stops carrying the previous topic. */
+  async newSession() {
+    this.queued = []
+    this.busy = false
+    this.sessionId = undefined
+    await this.openSession()
+    return this.sessionId
   }
 
   private speak(text: string) {
