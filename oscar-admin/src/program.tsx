@@ -219,11 +219,12 @@ function Compose({ members, leadId, onDone }: {
                   onChange={e => setComment(e.target.value)}
                   placeholder="Posted as the lead, right after the task is created" />
       </Field>
-      {/* Said here rather than in a doc, because putting the Meet link in a comment
-          and locking most of the cohort out of it has already happened twice. */}
-      <p className="-mt-3 text-xs text-amber-500/90">
-        Comments are readable by the owner and the primary assignee only. Anything
-        everyone must see belongs in the description.
+      {/* Every assignee can read the thread as of the comment-access fix. The
+          description is still the better place for the material itself — a comment is
+          a reply, not the brief. */}
+      <p className="-mt-3 text-xs text-ink-600">
+        Everyone assigned can read the comments. Only the owner and the primary
+        assignee are notified of new ones.
       </p>
 
       {err && <ErrorBox error={err} />}
