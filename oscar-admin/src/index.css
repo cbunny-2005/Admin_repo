@@ -43,23 +43,27 @@ body::before {
 @keyframes rise { from { opacity:0; transform: translateY(6px); } to { opacity:1; transform:none; } }
 .rise { animation: rise .28s cubic-bezier(.22,.68,0,1) both; }
 
-/* Tell the browser the page is dark.
+/* Native date/time pickers render WHITE.
  *
- * Without this the native date/time picker is rendered for a LIGHT page — dark text on
- * a dark popup, effectively unreadable, and the calendar button is a dark glyph on a
- * dark input so the field looks like it has no button at all. `color-scheme` is the
- * only way to reach those internals; they are not styleable with normal CSS.
+ * The popup and its calendar button are browser internals — normal CSS cannot reach
+ * them, and `color-scheme` is the only lever. `light` gives the standard white picker
+ * with black text, which is legible on every browser and needs no further styling.
+ * (`dark` renders a dark popup that varies by browser and came out unreadable here.)
  *
- * Declared on :root so scrollbars and every other native control match too. With it
- * set, the picker button is already light — inverting it (the first attempt here) made
- * it dark again, which is why the icon kept disappearing. */
-:root {
-  color-scheme: dark;
+ * Scoped to the inputs, NOT :root — declaring it globally would turn every other
+ * native control and the scrollbars light against a dark page. */
+input[type="datetime-local"],
+input[type="date"],
+input[type="time"] {
+  color-scheme: light;
 }
 
+/* With a light scheme the button is a dark glyph, which is correct against the white
+   popup but invisible on our dark input — so invert just the button back to light. */
 input[type="datetime-local"]::-webkit-calendar-picker-indicator,
 input[type="date"]::-webkit-calendar-picker-indicator,
 input[type="time"]::-webkit-calendar-picker-indicator {
+  filter: invert(1);
   opacity: 0.7;
   cursor: pointer;
 }
