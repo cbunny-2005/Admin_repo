@@ -75,8 +75,10 @@ export async function api<T>(path: string, signal?: AbortSignal): Promise<T> {
  */
 export async function send<T>(
   path: string,
-  method: 'POST' | 'PUT' | 'PATCH',
-  body: unknown,
+  // DELETE added for /admin/users/{id}. A DELETE with a body is legal but widely
+  // mishandled by proxies, so the body is omitted entirely when there isn't one.
+  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  body?: unknown,
   opts: { notFoundAsNull?: boolean } = {},
 ): Promise<T | null> {
   const base = getBase()
@@ -85,7 +87,7 @@ export async function send<T>(
     res = await fetch(base + path, {
       method,
       headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': getSecret() },
-      body: JSON.stringify(body),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     })
   } catch {
     throw new ApiError(

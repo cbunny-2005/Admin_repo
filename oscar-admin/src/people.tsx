@@ -17,7 +17,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Bell, Building2, Loader2, RotateCw, Search, ShieldCheck, UserPlus } from 'lucide-react'
+import { Bell, Building2, Loader2, RotateCw, Search, ShieldCheck, Trash2, UserMinus, UserPlus } from 'lucide-react'
 import { api, send } from './lib/api'
 import type { BusinessProfile, McpRow, MemberRow, NotificationRow, PushResult, TeamRow } from './lib/api'
 import { Badge, Card, Empty, ErrorBox, Field, Spinner, Table, Td, cx, inputCls } from './ui'
@@ -121,6 +121,7 @@ export function People() {
   const [probes, setProbes] = useState<Record<number, Probe>>({})
   const [profileFor, setProfileFor] = useState<TeamRow | null>(null)
   const [creating, setCreating] = useState(false)
+  const [removing, setRemoving] = useState(false)
 
   const load = useCallback(async (force = false) => {
     if (!force && CACHE && Date.now() - CACHE.at < CACHE_TTL_MS) {
@@ -236,6 +237,12 @@ export function People() {
                            text-xs font-semibold text-white transition hover:bg-brand-600">
           <UserPlus className="size-3.5" /> Create login
         </button>
+        <button onClick={() => setRemoving(true)}
+                className="flex items-center gap-2 rounded-xl border border-rose-500/40
+                           bg-rose-500/10 px-3 py-2 text-xs font-semibold text-rose-300
+                           transition hover:bg-rose-500/20">
+          <UserMinus className="size-3.5" /> Remove user
+        </button>
         <button onClick={() => void load(true)}
                 title="Re-fetch every team, ignoring the 2-minute cache"
                 className="flex items-center gap-2 rounded-xl border border-ink-600 bg-ink-800
@@ -274,6 +281,10 @@ export function People() {
         <CreateLogin teams={teams ?? []}
                      onClose={() => setCreating(false)}
                      onCreated={() => void load(true)} />
+      )}
+      {removing && (
+        <RemoveUser onClose={() => setRemoving(false)}
+                    onChanged={() => void load(true)} />
       )}
     </div>
   )
@@ -515,6 +526,172 @@ function CreateLogin({ teams, onClose, onCreated }: {
           This writes a real account to the live database. The gate codes are kept in this
           browser only — they are never committed to the repo.
         </p>
+      </div>
+    </Modal>
+  )
+}
+
+/** GET /admin/users?email= — the only route that turns an address into a user_id. */
+type FoundUser = {
+  id: number; name: string; username: string; email: string | null
+  account_type: string; is_active: number
+  teams: { team_id: number; team_name: string; role: string; is_active: number }[]
+  owns_teams: { id: number; name: string }[]
+}
+
+/**
+ * Remove a user, found by EMAIL.
+ *
+ * Email rather than name because names are not unique — there are two distinct users
+ * called "Sriram" (5 and 416), and the People search matches on name alone, so it cannot
+ * tell them apart. GET /admin/users?email= exists precisely to close that gap.
+ *
+ * Two different removals, deliberately separated:
+ *   · Remove from a team — PATCH, reversible, keeps the login and all their history.
+ *   · Delete the account  — DELETE, irreversible, and the only way to free the email so
+ *     the same address can be re-created (email and username are UNIQUE).
+ *
+ * The delete needs the word DELETE typed. This is the panel's only destructive action and
+ * the backend gives no undo, so a mis-click must not be enough.
+ */
+function RemoveUser({ onClose, onChanged }: { onClose: () => void; onChanged: () => void }) {
+  const [email, setEmail] = useState('')
+  const [found, setFound] = useState<FoundUser[] | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [confirm, setConfirm] = useState('')
+  const [done, setDone] = useState<string | null>(null)
+
+  const lookup = async () => {
+    const e = email.trim()
+    if (!e) return
+    setBusy(true); setErr(null); setFound(null); setDone(null); setConfirm('')
+    try {
+      // Fall back to a substring search when the exact address finds nobody — a
+      // mistyped domain is the common case and "not found" is a dead end otherwise.
+      const byEmail = await api<{ users: FoundUser[] }>(
+        `/admin/users?email=${encodeURIComponent(e)}`)
+      const users = byEmail.users.length
+        ? byEmail.users
+        : (await api<{ users: FoundUser[] }>(`/admin/users?q=${encodeURIComponent(e)}`)).users
+      setFound(users)
+    } catch (x) { setErr((x as Error).message) } finally { setBusy(false) }
+  }
+
+  const leaveTeam = async (u: FoundUser, teamId: number, teamName: string) => {
+    setBusy(true); setErr(null)
+    try {
+      await send(`/admin/users/${u.id}/teams/${teamId}`, 'PATCH', { is_active: 0 })
+      setDone(`${u.name} removed from ${teamName}. Their login still works — they must ` +
+              `log out and back in before the app stops showing that team.`)
+      setFound(null); onChanged()
+    } catch (x) { setErr((x as Error).message) } finally { setBusy(false) }
+  }
+
+  const deleteAccount = async (u: FoundUser) => {
+    setBusy(true); setErr(null)
+    try {
+      await send(`/admin/users/${u.id}`, 'DELETE')
+      setDone(`${u.name} deleted. ${u.email} is free again, so the same address can be ` +
+              `used in Create login.`)
+      setFound(null); onChanged()
+    } catch (x) { setErr((x as Error).message) } finally { setBusy(false) }
+  }
+
+  return (
+    <Modal onClose={onClose} wide>
+      <div className="space-y-4">
+        <div>
+          <div className="text-base font-semibold">Remove a user</div>
+          <div className="mt-1 text-xs text-ink-500">
+            Look them up by email — names are not unique.
+          </div>
+        </div>
+
+        <div className="flex gap-2">
+          <input className={inputCls} value={email} type="email" spellCheck={false}
+                 autoComplete="off" placeholder="someone@example.com"
+                 onChange={e => setEmail(e.target.value)}
+                 onKeyDown={e => { if (e.key === 'Enter') void lookup() }} />
+          <button onClick={() => void lookup()} disabled={busy || !email.trim()}
+                  className="flex shrink-0 items-center gap-2 rounded-xl bg-brand-500 px-4
+                             text-xs font-semibold text-white transition hover:bg-brand-600
+                             disabled:opacity-40">
+            {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Search className="size-3.5" />}
+            Find
+          </button>
+        </div>
+
+        {err && <ErrorBox error={err} />}
+        {done && (
+          <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3
+                          text-xs leading-relaxed text-emerald-200">{done}</div>
+        )}
+        {found?.length === 0 && (
+          <div className="text-sm text-ink-500">Nobody matches that.</div>
+        )}
+
+        {found?.map(u => (
+          <div key={u.id} className="space-y-3 rounded-xl border border-ink-600 bg-ink-800 p-4">
+            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+              <span className="text-sm font-semibold">{u.name}</span>
+              <span className="text-xs text-ink-400">{u.email}</span>
+              <Badge>user {u.id}</Badge>
+              <Badge>{u.account_type}</Badge>
+            </div>
+
+            {u.owns_teams.length > 0 && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-2
+                              text-[11px] leading-relaxed text-amber-200">
+                Owns {u.owns_teams.map(t => `${t.name} (${t.id})`).join(', ')}. Deleting this
+                account transfers the team to its oldest other member, or dissolves it if
+                there is nobody left.
+              </div>
+            )}
+
+            <div className="space-y-1.5">
+              {u.teams.length === 0 && (
+                <div className="text-xs text-ink-500">In no teams.</div>
+              )}
+              {u.teams.map(t => (
+                <div key={t.team_id} className="flex items-center gap-2 text-xs">
+                  <span className="text-ink-300">{t.team_name}</span>
+                  <Badge>{t.team_id}</Badge>
+                  <span className="text-ink-500">{t.role}</span>
+                  {t.is_active
+                    ? <button onClick={() => void leaveTeam(u, t.team_id, t.team_name)}
+                              disabled={busy}
+                              className="ml-auto rounded-lg border border-ink-600 px-2 py-1
+                                         font-medium transition hover:bg-ink-700
+                                         disabled:opacity-40">
+                        Remove from this team
+                      </button>
+                    : <span className="ml-auto text-ink-500">already removed</span>}
+                </div>
+              ))}
+            </div>
+
+            <div className="space-y-2 border-t border-ink-700 pt-3">
+              <div className="text-[11px] leading-relaxed text-rose-300">
+                Deleting is permanent — the account, its memberships and, by cascade, their
+                tasks, meetings, chat history and memories. There is no undo. Do this only
+                to free the email address for a fresh Create login.
+              </div>
+              <div className="flex gap-2">
+                <input className={inputCls} value={confirm} spellCheck={false}
+                       placeholder="type DELETE to confirm"
+                       onChange={e => setConfirm(e.target.value)} />
+                <button onClick={() => void deleteAccount(u)}
+                        disabled={busy || confirm !== 'DELETE'}
+                        className="flex shrink-0 items-center gap-2 rounded-xl bg-rose-600
+                                   px-4 text-xs font-semibold text-white transition
+                                   hover:bg-rose-500 disabled:opacity-40">
+                  <Trash2 className="size-3.5" /> Delete account
+                </button>
+              </div>
+            </div>
+          </div>
+        ))}
       </div>
     </Modal>
   )
