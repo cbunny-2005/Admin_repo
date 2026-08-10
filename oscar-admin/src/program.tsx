@@ -75,7 +75,12 @@ export function Program() {
         api<{ tasks: Task[] }>(`/teams/${TEAM_ID}/tasks?project=true`),
       ])
       setMembers(ms)
-      setTasks(ts.tasks ?? [])
+      // Cancelled tasks are NOT dropped by the API — GET /teams/{id}/tasks?project=true
+      // returns every status, so three cancelled tasks sat in this list looking active
+      // (no strikethrough, no badge) and someone tried to cancel them again to no effect.
+      // A cancelled task is not part of the programme any more; hide it here rather than
+      // deleting rows, so the comment threads survive.
+      setTasks((ts.tasks ?? []).filter(t => t.status !== 'cancelled'))
     } catch (e) { setError((e as Error).message) }
   }, [])
 
