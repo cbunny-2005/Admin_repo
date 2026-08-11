@@ -378,7 +378,13 @@ function TaskList({ tasks, leadId, onOpen, onChanged }: {
           return (
             <div key={g.key} className="rounded-xl bg-white/5">
               <div className="flex items-center gap-3 px-4 py-3">
-                <button onClick={() => setExpanded(expanded === g.key ? null : g.key)}
+                {/* A group of ONE has no person list to show, so clicking it must OPEN
+                    the thread — that is what every task did before fan-out existed, and
+                    every task created before today is still a group of one. Toggling
+                    `expanded` for those rendered nothing and made the thread unreachable. */}
+                <button onClick={() => g.ids.length > 1
+                          ? setExpanded(expanded === g.key ? null : g.key)
+                          : onOpen(g.sample)}
                         className="min-w-0 flex-1 text-left">
                   <div className="truncate text-sm font-semibold">{g.title}</div>
                   <div className="mt-0.5 truncate text-xs text-ink-600">
