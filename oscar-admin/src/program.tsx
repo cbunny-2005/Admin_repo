@@ -101,7 +101,7 @@ export function Program() {
   return (
     <div className="space-y-6">
       <Compose members={members} leadId={lead.user_id} onDone={load} />
-      <TaskList tasks={tasks} onOpen={setOpen} />
+      <TaskList tasks={tasks} leadId={lead.user_id} onOpen={setOpen} onChanged={load} />
     </div>
   )
 }
@@ -122,6 +122,7 @@ function Compose({ members, leadId, onDone }: {
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [progress, setProgress] = useState(0)
 
   const toggle = (id: number) => setPicked(s => {
     const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n
@@ -130,34 +131,66 @@ function Compose({ members, leadId, onDone }: {
   const count = all ? assignable.length : picked.size
   const canSend = title.trim() && due && count > 0 && !busy
 
+  /**
+   * ONE TASK PER PERSON, created iteratively.
+   *
+   * The backend also supports a single shared row with per-person assignee rows
+   * (assigned_to_user_ids / assign_to_all_members), and that is still what the Flutter
+   * app produces. This panel deliberately does NOT use it: on a shared row, closing the
+   * ITEM locks every remaining assignee out of ticking their own share, because
+   * complete_item early-returns once item.status == 'completed'. One row per person
+   * cannot hit that — each task has exactly one owner of its own state.
+   *
+   * The count you want (4/25) is reconstructed in the list by grouping on title + due
+   * date, so nothing is lost by fanning out. No backend change: this is N calls to the
+   * same POST /items the app already uses.
+   *
+   * Sequential on purpose. 25 concurrent POSTs against a single-worker uvicorn is a good
+   * way to make the whole backend feel broken for everyone actually using the app, and
+   * each call writes a row plus fires a notification.
+   */
   async function submit() {
     setBusy(true); setErr(null); setMsg(null)
+    const targets = all ? assignable.map(m => m.user_id) : [...picked]
+    const made: number[] = []
+    const failed: { id: number; why: string }[] = []
     try {
-      const body: Record<string, unknown> = {
-        user_id: leadId,
-        title: title.trim(),
-        due_at: toDueAt(due),
-        priority,
-        description: desc.trim() || undefined,
-        is_project: true,
+      for (const uid of targets) {
+        const body: Record<string, unknown> = {
+          user_id: leadId,
+          title: title.trim(),
+          due_at: toDueAt(due),
+          priority,
+          description: desc.trim() || undefined,
+          is_project: true,
+          assigned_to_user_id: uid,
+        }
+        try {
+          const res = await send<{ task: Task }>('/items', 'POST', body)
+          const task = res?.task
+          if (!task) throw new Error('no task returned')
+          made.push(task.id)
+          if (comment.trim()) {
+            // Per task, because each person now has their own thread. This is the real
+            // cost of fanning out — the Trainer Central link has to be posted N times
+            // rather than once on a shared row.
+            await send(`/users/${leadId}/tasks/${task.id}/comments`, 'POST',
+                       { body: comment.trim() })
+          }
+        } catch (e) {
+          // One failure must not lose the other 24. Report which, do not silently skip.
+          failed.push({ id: uid, why: (e as Error).message })
+        }
+        setProgress(made.length + failed.length)
       }
-      // "All" is a server-side expansion, not a list built here — so anyone who
-      // joins between loading this page and pressing send is still included.
-      if (all) body.assign_to_all_members = true
-      else body.assigned_to_user_ids = [...picked]
 
-      const res = await send<{ task: Task }>('/items', 'POST', body)
-      const task = res?.task
-      if (!task) throw new Error('no task returned')
-
-      if (comment.trim()) {
-        await send(`/users/${leadId}/tasks/${task.id}/comments`, 'POST',
-                   { body: comment.trim() })
-      }
-      setMsg(`Task #${task.id} created for ${task.assignee_count ?? count} people.`)
+      if (!made.length) throw new Error(failed[0]?.why ?? 'nothing was created')
+      setMsg(`Created ${made.length} task${made.length === 1 ? '' : 's'}` +
+             (failed.length ? ` — ${failed.length} FAILED (${failed.map(f => f.id).join(', ')})`
+                            : ' — one per person.'))
       setTitle(''); setDesc(''); setComment(''); setPicked(new Set())
       onDone()
-    } catch (e) { setErr((e as Error).message) } finally { setBusy(false) }
+    } catch (e) { setErr((e as Error).message) } finally { setBusy(false); setProgress(0) }
   }
 
   return (
@@ -240,7 +273,7 @@ function Compose({ members, leadId, onDone }: {
                 canSend ? 'bg-brand-500 text-white hover:bg-brand-600'
                         : 'bg-white/5 text-ink-600')}>
         {busy ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
-        {busy ? 'Creating…' : `Create & assign to ${count}`}
+        {busy ? `Creating ${progress}/${count}…` : `Create & assign to ${count}`}
       </button>
     </Card>
   )
@@ -248,35 +281,161 @@ function Compose({ members, leadId, onDone }: {
 
 // ── Task list ───────────────────────────────────────────────────────────────
 
-function TaskList({ tasks, onOpen }: { tasks: Task[]; onOpen: (t: Task) => void }) {
+/**
+ * One row per PERSON is what gets created, so 25 people means 25 tasks. Showing 25
+ * near-identical rows would be unreadable, so identical work is grouped back together
+ * here — same title, same due time — and the count is derived from the group.
+ *
+ * Grouping on (title, due_at) rather than an id: there is no batch id on the row, and
+ * adding one would be a schema change. The trade-off is honest and worth stating — two
+ * genuinely separate tasks that share a title AND a due minute would merge in this view.
+ * In practice that only happens when you assign the same thing twice by mistake, which
+ * is a thing you want to see merged anyway.
+ *
+ * A shared-row task from the Flutter app still renders correctly: it arrives as a single
+ * row carrying assignee_count/completed_count, so its group is one row and the count
+ * comes from the server instead of the group size.
+ */
+type Group = {
+  key: string; title: string; due: string; ids: number[]
+  total: number; done: number; overdue: boolean
+  hasDescription: boolean; sample: Task
+}
+
+function groupTasks(tasks: Task[]): Group[] {
+  const by = new Map<string, Task[]>()
+  for (const t of tasks) {
+    const key = `${t.title.trim().toLowerCase()}|${t.due_at ?? ''}`
+    const arr = by.get(key)
+    arr ? arr.push(t) : by.set(key, [t])
+  }
+  return [...by.entries()].map(([key, ts]) => {
+    const server = ts.length === 1 && (ts[0].assignee_count ?? 0) > 1
+    return {
+      key,
+      title: ts[0].title,
+      due: ts[0].due_label ?? ts[0].due_at ?? 'no due date',
+      ids: ts.map(t => t.id),
+      // A shared row reports its own counts; a fanned-out group counts its members.
+      total: server ? (ts[0].assignee_count ?? 1) : ts.length,
+      done: server
+        ? (ts[0].completed_count ?? 0)
+        : ts.filter(t => t.status === 'completed').length,
+      overdue: ts.some(t => t.is_overdue),
+      hasDescription: !!ts[0].description,
+      sample: ts[0],
+    }
+  })
+}
+
+function TaskList({ tasks, leadId, onOpen, onChanged }: {
+  tasks: Task[]; leadId: number; onOpen: (t: Task) => void; onChanged: () => void
+}) {
+  const groups = useMemo(() => groupTasks(tasks), [tasks])
+  const [busyKey, setBusyKey] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState<string | null>(null)
+
+  /**
+   * Mark every task in the group complete — the bulk action for a fanned-out batch.
+   *
+   * Sequential, and it skips the ones already done rather than re-sending: complete_item
+   * is idempotent, but each call still costs a round trip and can fire a notification.
+   */
+  async function completeGroup(g: Group) {
+    setBusyKey(g.key); setErr(null)
+    const pending = tasks.filter(t => g.ids.includes(t.id) && t.status !== 'completed')
+    let failed = 0
+    for (const t of pending) {
+      // user_id is a QUERY param on this route, not a body field. Sending it in the
+      // body returns 422 — which is exactly what the first version of this did.
+      try {
+        await send(`/items/${t.id}/complete?user_id=${leadId}`, 'PATCH')
+      } catch { failed++ }
+    }
+    setBusyKey(null)
+    if (failed) setErr(`${failed} of ${pending.length} could not be completed.`)
+    onChanged()
+  }
+
   if (!tasks.length) {
     return <Card className="p-6 text-sm text-ink-600">No tasks yet for this programme.</Card>
   }
   return (
     <Card className="p-6">
-      <div className="text-sm font-semibold">Tasks ({tasks.length})</div>
+      <div className="flex items-baseline gap-2">
+        <div className="text-sm font-semibold">Tasks ({groups.length})</div>
+        {groups.length !== tasks.length && (
+          <span className="text-xs text-ink-600">
+            {tasks.length} rows, one per person
+          </span>
+        )}
+      </div>
+      {err && <div className="mt-3"><ErrorBox error={err} /></div>}
       <div className="mt-4 space-y-2">
-        {tasks.map(t => {
-          const total = t.assignee_count ?? 1
-          const done = t.completed_count ?? (t.status === 'completed' ? 1 : 0)
+        {groups.map(g => {
+          const allDone = g.done >= g.total
           return (
-            <button key={t.id} onClick={() => onOpen(t)}
-                    className="flex w-full items-center gap-3 rounded-xl bg-white/5 px-4 py-3 text-left hover:bg-white/10">
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-semibold">{t.title}</div>
-                <div className="mt-0.5 truncate text-xs text-ink-600">
-                  #{t.id} · {t.due_label ?? t.due_at ?? 'no due date'}
-                  {t.description ? ' · has description' : ''}
-                </div>
-              </div>
-              {t.is_overdue && <Badge tone="danger">overdue</Badge>}
-              {total > 1 && (
-                <span className="shrink-0 text-xs tabular-nums text-ink-600">
-                  {done}/{total} done
+            <div key={g.key} className="rounded-xl bg-white/5">
+              <div className="flex items-center gap-3 px-4 py-3">
+                <button onClick={() => setExpanded(expanded === g.key ? null : g.key)}
+                        className="min-w-0 flex-1 text-left">
+                  <div className="truncate text-sm font-semibold">{g.title}</div>
+                  <div className="mt-0.5 truncate text-xs text-ink-600">
+                    {g.ids.length > 1 ? `${g.ids.length} tasks` : `#${g.ids[0]}`} · {g.due}
+                    {g.hasDescription ? ' · has description' : ''}
+                    {g.ids.length > 1 && (expanded === g.key ? ' · hide people' : ' · show people')}
+                  </div>
+                </button>
+                {g.overdue && !allDone && <Badge tone="danger">overdue</Badge>}
+                <span className={cx('shrink-0 text-xs tabular-nums',
+                                    allDone ? 'text-emerald-300' : 'text-ink-600')}>
+                  {g.done}/{g.total} done
                 </span>
+                {!allDone && (
+                  <button onClick={() => void completeGroup(g)} disabled={busyKey === g.key}
+                          title={`Mark all ${g.total - g.done} remaining complete`}
+                          className="flex shrink-0 items-center gap-1.5 rounded-lg border
+                                     border-ink-600 px-2 py-1 text-xs font-medium transition
+                                     hover:bg-ink-700 disabled:opacity-40">
+                    {busyKey === g.key
+                      ? <Loader2 className="size-3.5 animate-spin" />
+                      : <CheckCircle2 className="size-3.5" />}
+                    Complete all
+                  </button>
+                )}
+              </div>
+
+              {/* One row per person, so a comment can be addressed to ONE of them.
+                  This is the point of fanning out: a comment on a single-assignee task
+                  is readable by that person, the owner and team leads — verified against
+                  _task_for_user — and by NOBODY else on the cohort. On a shared row the
+                  same comment goes to all 25. */}
+              {expanded === g.key && g.ids.length > 1 && (
+                <div className="space-y-1 border-t border-white/5 px-4 py-3">
+                  <div className="pb-1 text-[11px] text-ink-600">
+                    Open one person to comment privately — only they and the lead can read it.
+                  </div>
+                  {tasks
+                    .filter(t => g.ids.includes(t.id))
+                    .sort((a, b) => (a.assigned_to_name ?? '').localeCompare(b.assigned_to_name ?? ''))
+                    .map(t => (
+                      <button key={t.id} onClick={() => onOpen(t)}
+                              className="flex w-full items-center gap-3 rounded-lg px-2 py-1.5
+                                         text-left text-xs hover:bg-white/10">
+                        {t.status === 'completed'
+                          ? <CheckCircle2 className="size-3.5 shrink-0 text-emerald-300" />
+                          : <span className="size-3.5 shrink-0 rounded-full border border-ink-600" />}
+                        <span className="min-w-0 flex-1 truncate">
+                          {t.assigned_to_name ?? `user ${t.id}`}
+                        </span>
+                        <span className="shrink-0 text-ink-600">#{t.id}</span>
+                        <MessageSquare className="size-3.5 shrink-0 text-ink-600" />
+                      </button>
+                    ))}
+                </div>
               )}
-              <MessageSquare className="size-4 shrink-0 text-ink-600" />
-            </button>
+            </div>
           )
         })}
       </div>
