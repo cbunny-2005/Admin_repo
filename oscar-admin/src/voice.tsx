@@ -206,8 +206,16 @@ export function Voice() {
           <div className="mt-4 space-y-2 text-sm tabular-nums">
             {log.map((r, i) => (
               <div key={i} className="flex items-baseline justify-between gap-3">
+                {/* Every stamp is cumulative from speech-end, so the per-leg cost is
+                    a subtraction. The old row labelled that last subtraction "TTS",
+                    which was wrong on a tool turn: the gap between first token and
+                    first word is the TOOL running plus a SECOND model pass, not
+                    speech synthesis. It is called "speak" now, and a tool turn is
+                    tagged so it is never compared against a plain reply. */}
                 <span className="text-ink-600">
-                  STT {r.sttMs}ms · LLM {r.llmMs}ms · TTS {(r.audioMs ?? 0) - (r.llmMs ?? 0)}ms
+                  #{r.turn} · STT {r.sttMs}ms · think {(r.llmMs ?? 0) - (r.sttMs ?? 0)}ms
+                  {' · speak '}{(r.audioMs ?? 0) - (r.llmMs ?? 0)}ms
+                  {r.tool && <span className="ml-1 text-amber-500/90">· tool</span>}
                 </span>
                 <span className="font-semibold">{((r.audioMs ?? 0) / 1000).toFixed(2)}s</span>
               </div>

@@ -87,6 +87,15 @@ export type Timings = {
   sttMs?: number       // speech end → final transcript
   llmMs?: number       // speech end → first token
   audioMs?: number     // speech end → first spoken word
+  /** Which turn these belong to. Without it, a slow turn's audio arriving after the
+   *  next utterance began was measured against the NEW anchor and logged a 0.11s
+   *  total with a NEGATIVE tts figure — a number that reads as a speed record and is
+   *  actually two turns spliced together. */
+  turn?: number
+  /** True once a tool ran. A tool turn is TWO model passes with the tool in between,
+   *  so its first-word time is not comparable to a plain reply and must not be
+   *  averaged with one. */
+  tool?: boolean
 }
 
 export type Handlers = {
@@ -156,6 +165,11 @@ export class LiveVoice {
   private queued: string[] = []
 
   private speechEndAt = 0
+  // The anchor is FROZEN when a turn starts. speechEndAt keeps moving as the person
+  // talks; measuring against it mid-turn is what produced negative durations.
+  private turnAnchor = 0
+  private turnId = 0
+  private spokenFiller = false
   private t: Timings = {}
   private reply = ''
   private spokenFirst = false
@@ -339,7 +353,10 @@ export class LiveVoice {
           this.h.onFinal([...this.queued].join(' '))
           return
         }
-        this.t = { sttMs: Math.round(performance.now() - this.speechEndAt) }
+        this.turnId += 1
+        this.turnAnchor = this.speechEndAt
+        this.t = { turn: this.turnId,
+                   sttMs: Math.round(performance.now() - this.turnAnchor) }
         this.h.onTimings(this.t)
         this.h.onFinal(text)
         void this.ask(text)
@@ -357,7 +374,7 @@ export class LiveVoice {
     const b = m?.data?.audio
     if (b) {
       if (this.t.audioMs === undefined) {
-        this.t.audioMs = Math.round(performance.now() - this.speechEndAt)
+        this.t.audioMs = Math.round(performance.now() - this.turnAnchor)
         this.h.onTimings({ ...this.t })
         this.h.onPhase('speaking')
       }
@@ -478,7 +495,7 @@ export class LiveVoice {
     }
     this.busy = true
     this.reply = ''
-    this.spokenFirst = false
+    this.spokenFirst = false; this.spokenFiller = false
     this.t.llmMs = undefined
     this.t.audioMs = undefined
     try {
@@ -520,7 +537,7 @@ export class LiveVoice {
       case 'chat.delta': {
         if (!p.text) return
         if (this.t.llmMs === undefined) {
-          this.t.llmMs = Math.round(performance.now() - this.speechEndAt)
+          this.t.llmMs = Math.round(performance.now() - this.turnAnchor)
           this.h.onTimings({ ...this.t })
         }
         this.reply += p.text
@@ -532,12 +549,38 @@ export class LiveVoice {
         }
         break
       }
+      /**
+       * A TOOL turn is two model passes with the tool executed in between, so the
+       * user hears NOTHING from the first token until the second pass produces a
+       * sentence — measured at 3.3s on a create_task turn, which is most of a 5.2s
+       * total and reads as a hang.
+       *
+       * The backend already names what it is doing ("checking your tasks"), so say
+       * that. It does not make the turn faster; it makes the wait audible, which is
+       * the part the person actually experiences. Spoken only when nothing has been
+       * said yet — never on top of a real answer.
+       */
+      case 'chat.tool': {
+        this.t.tool = true
+        this.h.onTimings({ ...this.t })
+        if (!this.spokenFirst && !this.spokenFiller) {
+          const label = (p.label ?? '').toString().trim()
+          if (label) {
+            this.spokenFiller = true
+            // Deliberately NOT setting spokenFirst: the real first sentence must
+            // still be spoken when it arrives. This is filler, not the answer.
+            this.speak(label.endsWith('.') ? label : label + '.')
+          }
+        }
+        break
+      }
+
       case 'chat.complete': {
         // chat.complete.text is AUTHORITATIVE and replaces the buffer — that is the
         // documented contract, and it is how a fast-path reply (zero deltas) arrives.
         const full = (p.text ?? '').toString()
         if (this.t.llmMs === undefined) {
-          this.t.llmMs = Math.round(performance.now() - this.speechEndAt)
+          this.t.llmMs = Math.round(performance.now() - this.turnAnchor)
           this.h.onTimings({ ...this.t })
         }
         this.reply = full
