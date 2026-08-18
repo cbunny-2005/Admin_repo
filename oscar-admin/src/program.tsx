@@ -126,6 +126,33 @@ function Compose({ members, leadId, onDone }: {
   const [msg, setMsg] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
+  // Held as raw Files, NOT uploaded yet. The upload route needs an item_id and the
+  // tasks do not exist until Send — so unlike the Thread composer (which uploads on
+  // pick), these can only go up once each person's task has been created.
+  const [files, setFiles] = useState<File[]>([])
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  /** Same whitelist and cap the server enforces — checked here only so a bad file is
+   *  caught before it is uploaded N times. */
+  function pickFiles(list: FileList | null) {
+    if (!list) return
+    const ok: File[] = []
+    for (const f of Array.from(list)) {
+      const ext = f.name.includes('.') ? f.name.split('.').pop()!.toLowerCase() : ''
+      if (!(ATTACH_EXTS as readonly string[]).includes(ext)) {
+        setErr(`${f.name}: unsupported file type — allowed: ${ATTACH_EXTS.join(', ')}`); continue
+      }
+      if (f.size > ATTACH_MAX_BYTES) {
+        setErr(`${f.name}: too large (${prettyBytes(f.size)}); limit is ${prettyBytes(ATTACH_MAX_BYTES)}`); continue
+      }
+      ok.push(f)
+    }
+    if (ok.length) setFiles(fs => [...fs, ...ok])
+    if (fileRef.current) fileRef.current.value = ''
+  }
+
+  const dropFile = (i: number) => setFiles(fs => fs.filter((_, n) => n !== i))
+  const filesBytes = files.reduce((n, f) => n + f.size, 0)
 
   const toggle = (id: number) => setPicked(s => {
     const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n
@@ -173,12 +200,28 @@ function Compose({ members, leadId, onDone }: {
           const task = res?.task
           if (!task) throw new Error('no task returned')
           made.push(task.id)
-          if (comment.trim()) {
+          // Files are uploaded PER TASK — the row carries item_id NOT NULL, so one
+          // attachment cannot be shared across 43 people's tasks. That is the real
+          // price of fanning out: the same PDF is stored once per person. Sequential
+          // for the same reason the task loop is (single-worker uvicorn).
+          const attIds: number[] = []
+          for (const f of files) {
+            try {
+              const a = await upload<TaskAttachment>(
+                `/users/${leadId}/tasks/${task.id}/attachments`, f)
+              attIds.push(a.id)
+            } catch (e) {
+              // A failed upload must not cost the person their task or the text of
+              // the comment — record it and post what we have.
+              failed.push({ id: uid, why: `${f.name}: ${(e as Error).message}` })
+            }
+          }
+          if (comment.trim() || attIds.length) {
             // Per task, because each person now has their own thread. This is the real
             // cost of fanning out — the Trainer Central link has to be posted N times
             // rather than once on a shared row.
             await send(`/users/${leadId}/tasks/${task.id}/comments`, 'POST',
-                       { body: comment.trim() })
+                       { body: comment.trim(), attachment_ids: attIds })
           }
         } catch (e) {
           // One failure must not lose the other 24. Report which, do not silently skip.
@@ -191,7 +234,7 @@ function Compose({ members, leadId, onDone }: {
       setMsg(`Created ${made.length} task${made.length === 1 ? '' : 's'}` +
              (failed.length ? ` — ${failed.length} FAILED (${failed.map(f => f.id).join(', ')})`
                             : ' — one per person.'))
-      setTitle(''); setDesc(''); setComment(''); setPicked(new Set())
+      setTitle(''); setDesc(''); setComment(''); setPicked(new Set()); setFiles([])
       onDone()
     } catch (e) { setErr((e as Error).message) } finally { setBusy(false); setProgress(0) }
   }
@@ -260,10 +303,52 @@ function Compose({ members, leadId, onDone }: {
                   onChange={e => setComment(e.target.value)}
                   placeholder="Posted as the lead, right after the task is created" />
       </Field>
+      {/* Attachments ride on that first comment — the ONLY place the backend accepts
+          a file. There is no attachment on the task itself, so a spec sheet has to be
+          posted as a comment. */}
+      <div className="-mt-2">
+        <input ref={fileRef} type="file" multiple className="hidden"
+               accept={ATTACH_EXTS.map(e => '.' + e).join(',')}
+               onChange={e => pickFiles(e.target.files)} />
+        <button type="button" onClick={() => fileRef.current?.click()} disabled={busy}
+                className="flex items-center gap-2 rounded-xl bg-white/5 px-3 py-2 text-xs
+                           font-semibold text-ink-300 hover:bg-white/10 disabled:opacity-50">
+          <Paperclip className="size-3.5" />
+          Attach files
+        </button>
+
+        {files.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-2">
+            {files.map((f, i) => (
+              <span key={`${f.name}-${i}`}
+                    className="flex items-center gap-2 rounded-lg bg-white/5 px-2.5 py-1.5 text-xs">
+                <FileText className="size-3.5 shrink-0 text-ink-400" />
+                <span className="max-w-[16rem] truncate">{f.name}</span>
+                <span className="tabular-nums text-ink-600">{prettyBytes(f.size)}</span>
+                <button type="button" onClick={() => dropFile(i)}
+                        className="text-ink-600 hover:text-rose-300">
+                  <X className="size-3.5" />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Said plainly, because it is a surprise: an attachment belongs to ONE task,
+            so N people means N uploads of the same bytes and a visibly slower Send. */}
+        {files.length > 0 && count > 0 && (
+          <p className="mt-2 text-xs text-amber-500/90">
+            {files.length} file{files.length > 1 ? 's' : ''} × {count} {count === 1 ? 'person' : 'people'} ={' '}
+            {files.length * count} uploads ({prettyBytes(filesBytes * count)}) — each person's
+            task gets its own copy. This makes Send take a while; leave the tab open.
+          </p>
+        )}
+      </div>
+
       {/* Every assignee can read the thread as of the comment-access fix. The
           description is still the better place for the material itself — a comment is
           a reply, not the brief. */}
-      <p className="-mt-3 text-xs text-ink-600">
+      <p className="-mt-1 text-xs text-ink-600">
         Everyone assigned can read the comments. Only the owner and the primary
         assignee are notified of new ones.
       </p>
