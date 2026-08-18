@@ -112,6 +112,91 @@ export async function send<T>(
 /** Attachment URLs come back RELATIVE, so they need the base prefixed to render. */
 export const imgUrl = (path: string) => getBase() + path
 
+/**
+ * Multipart upload. Deliberately NOT send(): that sets Content-Type: application/json,
+ * and setting Content-Type by hand on a FormData body strips the multipart boundary the
+ * browser generates, so the server sees a malformed body. Let fetch set the header.
+ */
+export async function upload<T>(path: string, file: File): Promise<T> {
+  const base = getBase()
+  const form = new FormData()
+  form.append('file', file)
+  let res: Response
+  try {
+    res = await fetch(base + path, {
+      method: 'POST',
+      headers: { 'X-Admin-Secret': getSecret() },
+      body: form,
+    })
+  } catch {
+    throw new ApiError(
+      0,
+      `Cannot reach ${base}. Either the host is down, or this page's origin ` +
+        `(${location.origin}) is not in the backend's CORS_ORIGINS.`,
+    )
+  }
+  if (res.status === 401) throw new ApiError(401, 'Admin secret rejected.')
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`
+    try {
+      const j = await res.json()
+      if (j?.detail) detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)
+    } catch { /* non-JSON error body — keep the status line */ }
+    throw new ApiError(res.status, detail)
+  }
+  return res.json() as Promise<T>
+}
+
+/**
+ * One comment attachment. `url`/`thumbnail_url` are RELATIVE access-checked routes
+ * (302 → S3); `direct_url`/`thumbnail_direct_url` are permanent public S3 links, and
+ * are null whenever the bucket is flipped back to private. `thumbnail_*` is a ≈256px
+ * preview for an image OR a PDF's rendered first page, and null for every other
+ * document. `page_count` is PDFs only.
+ */
+export type TaskAttachment = {
+  id: number; comment_id: number | null
+  file_name: string | null; mime_type: string; kind: string; is_image: boolean
+  byte_size: number; page_count: number | null
+  url: string; direct_url: string | null
+  thumbnail_url: string | null; thumbnail_direct_url: string | null
+}
+
+/**
+ * Resolve an attachment to something an <img> or <a> can use.
+ *
+ * The direct link is preferred when present — it skips our 302 and is cacheable
+ * forever (uuid key, immutable object). When it is null the bucket is private, so we
+ * fall back to the relative route, which re-mints a signed URL per request and needs
+ * `user_id` because that route re-checks task access. The thumbnail route already
+ * carries `?thumb=1`, hence the separator has to be computed, not hardcoded.
+ */
+export function attUrl(a: TaskAttachment, userId: number, thumb = false): string | null {
+  if (thumb) {
+    if (a.thumbnail_direct_url) return a.thumbnail_direct_url
+    if (!a.thumbnail_url) return null
+    return `${getBase()}${a.thumbnail_url}&user_id=${userId}`
+  }
+  if (a.direct_url) return a.direct_url
+  return `${getBase()}${a.url}${a.url.includes('?') ? '&' : '?'}user_id=${userId}`
+}
+
+/** Mirrors the backend whitelist in task_attachment_service._TYPES, so a file the
+ *  server will certainly reject never costs an upload round trip. */
+export const ATTACH_EXTS = [
+  'pdf', 'xlsx', 'xls', 'csv', 'docx', 'doc', 'pptx', 'ppt', 'txt',
+  'png', 'jpg', 'jpeg', 'webp', 'heic',
+] as const
+
+/** Server default (MAX_TASK_ATTACHMENT_BYTES). Overriding it there without changing
+ *  this only makes the client stricter, never wrong. */
+export const ATTACH_MAX_BYTES = 25 * 1024 * 1024
+
+export const prettyBytes = (n: number) =>
+  n < 1024 ? `${n} B`
+  : n < 1024 * 1024 ? `${(n / 1024).toFixed(0)} KB`
+  : `${(n / (1024 * 1024)).toFixed(1)} MB`
+
 // ── Shapes, matching the backend exactly ────────────────────────────────────
 
 export type Overview = {
