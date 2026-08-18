@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { CheckCircle2, ChevronLeft, Loader2, MessageSquare, Send, UserPlus, Users } from 'lucide-react'
-import { api, send } from './lib/api'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { CheckCircle2, ChevronLeft, FileText, Loader2, MessageSquare, Paperclip, Send, UserPlus, Users, X } from 'lucide-react'
+import type { TaskAttachment } from './lib/api'
+import { ATTACH_EXTS, ATTACH_MAX_BYTES, api, attUrl, prettyBytes, send, upload } from './lib/api'
 import { Badge, Card, ErrorBox, Field, Spinner, cx, inputCls } from './ui'
 
 /**
@@ -43,6 +44,8 @@ type Task = {
 type Comment = {
   id: number; user_id: number; user_name?: string; role: string
   body: string; created_at?: string
+  // Present since the 2026-08-18 backend; absent on an older deployment, hence optional.
+  attachments?: TaskAttachment[]
 }
 
 /** `datetime-local` gives "YYYY-MM-DDTHH:MM"; the backend stores IST-naive seconds. */
@@ -460,6 +463,11 @@ function Thread({ task, leadId, members, onBack, onChanged }: {
   const [error, setError] = useState<string | null>(null)
   const [body, setBody] = useState('')
   const [busy, setBusy] = useState(false)
+  // Files uploaded but not yet linked to a comment (the backend's two-phase link:
+  // the row is written with comment_id NULL and re-parented when the comment posts).
+  const [staged, setStaged] = useState<TaskAttachment[]>([])
+  const [uploading, setUploading] = useState(0)
+  const fileRef = useRef<HTMLInputElement>(null)
 
   const load = useCallback(async () => {
     setError(null)
@@ -473,15 +481,68 @@ function Thread({ task, leadId, members, onBack, onChanged }: {
 
   useEffect(() => { void load() }, [load])
 
+  /**
+   * A comment may be text, files, or both — the backend rejects only the case where
+   * it is neither. So a bare "here's the sheet" upload with no words is a legitimate
+   * comment and must not be blocked here.
+   */
   async function post() {
-    if (!body.trim()) return
+    if (!body.trim() && staged.length === 0) return
     setBusy(true)
     try {
-      await send(`/users/${leadId}/tasks/${task.id}/comments`, 'POST', { body: body.trim() })
+      await send(`/users/${leadId}/tasks/${task.id}/comments`, 'POST',
+                 { body: body.trim(), attachment_ids: staged.map(a => a.id) })
       setBody('')
+      setStaged([])
       await load()
     } catch (e) { setError((e as Error).message) } finally { setBusy(false) }
   }
+
+  /**
+   * Upload on pick, not on send. The file is in S3 and has a row before the lead has
+   * finished typing, so Send is instant — and an upload abandoned by navigating away
+   * just stays unlinked server-side rather than being lost mid-post.
+   *
+   * Uploaded AS THE LEAD, matching the thread read: the route re-checks task access
+   * with the same gate, so any other id would 404 on a task the lead owns.
+   *
+   * Files go up one at a time. The endpoint takes a single file, and a 25-file
+   * parallel burst against a free-tier service is a good way to turn one bad upload
+   * into fifteen; a rejected file also has to name ITSELF in the error, which a
+   * Promise.all would flatten away.
+   */
+  async function pick(files: FileList | null) {
+    if (!files || files.length === 0) return
+    setError(null)
+    for (const f of Array.from(files)) {
+      const ext = f.name.includes('.') ? f.name.split('.').pop()!.toLowerCase() : ''
+      // Checked here only to skip a pointless round trip — the server re-validates
+      // every one of these (extension, magic bytes, executable signatures) and its
+      // answer is the authoritative one.
+      if (!(ATTACH_EXTS as readonly string[]).includes(ext)) {
+        setError(`${f.name}: unsupported file type — allowed: ${ATTACH_EXTS.join(', ')}`)
+        continue
+      }
+      if (f.size > ATTACH_MAX_BYTES) {
+        setError(`${f.name}: too large (${prettyBytes(f.size)}); limit is ${prettyBytes(ATTACH_MAX_BYTES)}`)
+        continue
+      }
+      setUploading(n => n + 1)
+      try {
+        const a = await upload<TaskAttachment>(
+          `/users/${leadId}/tasks/${task.id}/attachments`, f)
+        setStaged(s => [...s, a])
+      } catch (e) { setError(`${f.name}: ${(e as Error).message}`) }
+      finally { setUploading(n => n - 1) }
+    }
+    // Same file twice in a row fires no change event unless the input is cleared.
+    if (fileRef.current) fileRef.current.value = ''
+  }
+
+  /** Drops the file from THIS comment only. The row and the S3 object stay — there is
+   *  no delete endpoint for an attachment, and an unlinked row is invisible in every
+   *  thread, so this is the honest extent of what "remove" can mean here. */
+  const unstage = (id: number) => setStaged(s => s.filter(a => a.id !== id))
 
   const total = task.assignee_count ?? 1
   const done = task.completed_count ?? 0
@@ -588,23 +649,107 @@ function Thread({ task, leadId, members, onBack, onChanged }: {
                   <span className="font-semibold text-ink-300">{c.user_name ?? `user ${c.user_id}`}</span>
                   <span>{c.created_at}</span>
                 </div>
-                <div className="whitespace-pre-wrap text-sm">{c.body}</div>
+                {c.body && <div className="whitespace-pre-wrap text-sm">{c.body}</div>}
+                {c.attachments && c.attachments.length > 0 && (
+                  <div className={cx('flex flex-wrap gap-2', c.body && 'mt-2')}>
+                    {c.attachments.map(a => <Attachment key={a.id} a={a} userId={leadId} />)}
+                  </div>
+                )}
               </div>
             ))}
           </div>
         )}
 
+        {/* Staged files sit ABOVE the input, so what is about to be sent is visible
+            without hunting — a file already uploaded but not yet attached is the one
+            state where "did that work?" is a fair question. */}
+        {(staged.length > 0 || uploading > 0) && (
+          <div className="mt-4 flex flex-wrap gap-2">
+            {staged.map(a => (
+              <span key={a.id}
+                    className="flex items-center gap-2 rounded-lg bg-white/5 px-2.5 py-1.5 text-xs">
+                <FileText className="size-3.5 shrink-0 text-ink-400" />
+                <span className="max-w-[16rem] truncate">{a.file_name ?? `file ${a.id}`}</span>
+                <span className="tabular-nums text-ink-600">{prettyBytes(a.byte_size)}</span>
+                <button onClick={() => unstage(a.id)} title="Remove from this reply"
+                        className="text-ink-600 hover:text-rose-300">
+                  <X className="size-3.5" />
+                </button>
+              </span>
+            ))}
+            {uploading > 0 && (
+              <span className="flex items-center gap-2 rounded-lg bg-white/5 px-2.5 py-1.5 text-xs text-ink-400">
+                <Loader2 className="size-3.5 animate-spin" />
+                Uploading {uploading} file{uploading > 1 ? 's' : ''}…
+              </span>
+            )}
+          </div>
+        )}
+
         <div className="mt-5 flex gap-2">
-          <input className={inputCls} value={body} placeholder="Reply as the lead…"
+          <input ref={fileRef} type="file" multiple className="hidden"
+                 accept={ATTACH_EXTS.map(e => '.' + e).join(',')}
+                 onChange={e => void pick(e.target.files)} />
+          <button onClick={() => fileRef.current?.click()} disabled={busy}
+                  title={`Attach a file — ${ATTACH_EXTS.join(', ')}, up to ${prettyBytes(ATTACH_MAX_BYTES)}`}
+                  className="shrink-0 rounded-xl bg-white/5 px-3 py-2.5 text-ink-400
+                             hover:bg-white/10 hover:text-ink-200 disabled:opacity-50">
+            <Paperclip className="size-4" />
+          </button>
+          <input className={inputCls} value={body}
+                 placeholder={staged.length > 0 ? 'Add a message — optional' : 'Reply as the lead…'}
                  onChange={e => setBody(e.target.value)}
                  onKeyDown={e => { if (e.key === 'Enter') void post() }} />
-          <button onClick={post} disabled={busy || !body.trim()}
+          {/* Sendable on files alone: a file-only comment is valid server-side, and
+              disabling Send until something is typed would strand an uploaded file. */}
+          <button onClick={post} disabled={busy || uploading > 0 || (!body.trim() && staged.length === 0)}
                   className={cx('rounded-xl px-4 py-2.5 text-sm font-semibold',
-                    body.trim() ? 'bg-brand-500 text-white hover:bg-brand-600' : 'bg-white/5 text-ink-600')}>
+                    (body.trim() || staged.length > 0) && uploading === 0
+                      ? 'bg-brand-500 text-white hover:bg-brand-600' : 'bg-white/5 text-ink-600')}>
             {busy ? <Loader2 className="size-4 animate-spin" /> : 'Send'}
           </button>
         </div>
       </Card>
     </div>
+  )
+}
+
+// ── Attachment ──────────────────────────────────────────────────────────────
+
+/**
+ * One file on a comment. A preview is shown whenever the backend produced a
+ * thumbnail — which covers images AND the rendered first page of a PDF, the same
+ * field either way — and a labelled chip otherwise, because a Word or Excel file has
+ * no preview and a broken image frame is worse than an honest icon.
+ *
+ * Opens in a new tab rather than downloading: the relative route 302s to a
+ * short-lived signed URL, which a same-tab navigation would leave in history to rot.
+ */
+function Attachment({ a, userId }: { a: TaskAttachment; userId: number }) {
+  const href = attUrl(a, userId)
+  const thumb = attUrl(a, userId, true)
+  const name = a.file_name ?? `file ${a.id}`
+  const meta = [prettyBytes(a.byte_size), a.page_count ? `${a.page_count} pages` : null]
+    .filter(Boolean).join(' · ')
+
+  if (thumb) {
+    return (
+      <a href={href ?? undefined} target="_blank" rel="noreferrer" title={`${name} — ${meta}`}
+         className="group block overflow-hidden rounded-xl border border-ink-700/70 bg-black/30">
+        <img src={thumb} alt={name}
+             className="h-28 w-28 object-cover transition group-hover:opacity-80" />
+        <div className="max-w-[7rem] truncate px-2 py-1 text-[11px] text-ink-400">{name}</div>
+      </a>
+    )
+  }
+
+  return (
+    <a href={href ?? undefined} target="_blank" rel="noreferrer"
+       className="flex items-center gap-2 rounded-xl bg-white/5 px-3 py-2 text-xs
+                  hover:bg-white/10">
+      <FileText className="size-4 shrink-0 text-ink-400" />
+      <span className="max-w-[16rem] truncate font-medium">{name}</span>
+      <span className="tabular-nums text-ink-600">{meta}</span>
+    </a>
   )
 }
