@@ -21,7 +21,21 @@
  *    difference between "it thinks, then talks" and "it starts talking".
  */
 
-const KEY = import.meta.env.VITE_SARVAM_KEY as string | undefined
+import { getSecret } from './api'
+
+/**
+ * 🔴 VITE_SARVAM_KEY IS GONE, ON PURPOSE — do not put it back.
+ *
+ * It used to be read here and sent as a WebSocket subprotocol. Vite inlines every
+ * VITE_* value into the shipped bundle, so on any deployed page that key was
+ * readable by whoever opened it. The key now lives on the backend and the speech
+ * sockets are relayed through it.
+ *
+ * What the browser sends instead is the ADMIN SECRET the panel already holds, as
+ * `?k=` — a WebSocket cannot set headers, so a query param is the only channel. It
+ * gates OUR relay; it is not a Sarvam credential, and it cannot be used to call
+ * Sarvam directly.
+ */
 
 /** The REAL backend. `/chat/stream` is used, not `/chat`: it streams the agent's
  *  tokens over the WebSocket the client already holds, so the first sentence can be
@@ -31,16 +45,42 @@ const KEY = import.meta.env.VITE_SARVAM_KEY as string | undefined
 const BASE = (import.meta.env.VITE_BACKEND_URL as string | undefined)
   ?? 'http://127.0.0.1:8000'
 const DEFAULT_USER_ID = Number(import.meta.env.VITE_CHAT_USER_ID ?? 90)
-/** bulbul:v3 voice. Sarvam ships 44; these are the ones worth trying first for an
- *  English-India assistant. `dev` is the default. */
+/**
+ * bulbul:v3 voices, VERIFIED against the live API on 2026-08-19 — every name here
+ * returned audio, and the seven that did not (karun, hitesh, abhilash, anushka,
+ * manisha, vidya, arya) have been removed.
+ *
+ * They were v2 speaker names. Selecting one did not fail loudly: the config frame was
+ * rejected and the turn simply produced SILENCE, which is indistinguishable from a
+ * broken microphone, a dead socket or a hung backend. A picker must never offer a
+ * choice that quietly does nothing.
+ *
+ * `dev` is the default and is a MALE voice — the first four here are male, the last
+ * four female. Re-verify this list when the model version changes; the names are not
+ * stable across bulbul versions, which is exactly how the dead ones got in.
+ */
 export const SPEAKERS = [
-  'dev', 'shubh', 'karun', 'hitesh', 'abhilash', 'rahul', 'amit', 'varun',
-  'anushka', 'manisha', 'vidya', 'arya', 'priya', 'neha', 'kavya', 'shreya',
+  'dev', 'shubh', 'rahul', 'amit', 'varun',      // male
+  'priya', 'neha', 'kavya', 'shreya',            // female
 ]
 const DEFAULT_SPEAKER = (import.meta.env.VITE_SARVAM_SPEAKER as string) ?? 'dev'
 
-const STT_WS = 'wss://api.sarvam.ai/speech-to-text-realtime/ws'
-const TTS_WS = 'wss://api.sarvam.ai/text-to-speech/ws'
+/**
+ * Speech sockets now go through OUR backend, not to Sarvam directly.
+ *
+ * The direct connection worked and was fine on localhost, but Vite inlines every
+ * VITE_* value into the shipped bundle — so a deployed page handed the Sarvam key to
+ * anyone who opened it. The relay holds the key server-side and passes frames through
+ * untouched, so the protocol below is unchanged; only the URL moved.
+ *
+ * Derived from VITE_BACKEND_URL so it follows the backend across localhost / dev /
+ * prod with no extra config, and http→ws / https→wss so a deployed page (which MUST
+ * be https for getUserMedia) does not try to open an insecure socket and get blocked
+ * by the browser as mixed content.
+ */
+const WS_BASE = BASE.replace(/^http/, 'ws')
+const STT_WS = `${WS_BASE}/voice/sarvam/stt`
+const TTS_WS = `${WS_BASE}/voice/sarvam/tts`
 
 const FRAME_MS = 100
 const TARGET_SR = 16000
@@ -79,6 +119,13 @@ function firstChunkEnd(s: string): number {
 /** How long the TTS socket must be quiet before we treat the reply as fully
  *  synthesised. Chunks arrive ~32 ms apart, so 250 ms is comfortably past the gap
  *  without adding noticeable delay before playback starts. */
+/** How long after the voice starts before an interruption is believed. Echo is
+ *  loudest at the start, and nobody interrupts before they have heard anything. */
+const BARGE_GRACE_MS = 600
+/** A second speech_start must follow within this window to count as a real
+ *  interruption. Echo produces one blip; a person talking keeps producing them. */
+const BARGE_WINDOW_MS = 1200
+
 const IDLE_MS = 250
 
 export type Phase = 'idle' | 'listening' | 'thinking' | 'speaking'
@@ -170,6 +217,14 @@ export class LiveVoice {
   private turnAnchor = 0
   private turnId = 0
   private spokenFiller = false
+  private speaking = false
+  /** True once the LAST text of this turn has been sent to TTS. Until then, silence on
+   *  the socket means "the model is still writing", NOT "the reply is over". */
+  private textDone = false
+  /** When playback of this reply began — the anchor for BARGE_GRACE_MS. */
+  private spokeAt = 0
+  /** When the first unconfirmed speech_start arrived, 0 if none is pending. */
+  private bargeSeen = 0
   private t: Timings = {}
   private reply = ''
   private spokenFirst = false
@@ -207,7 +262,10 @@ export class LiveVoice {
   get isRunning() { return this.running }
 
   async start() {
-    if (!KEY) { this.h.onError('VITE_SARVAM_KEY is not set'); return }
+    if (!getSecret()) {
+      this.h.onError('Sign in first — the speech relay needs the admin secret.')
+      return
+    }
     if (this.running) return
     this.running = true
     try {
@@ -241,11 +299,27 @@ export class LiveVoice {
     this.h.onPhase('idle')
   }
 
+  /** Stop the current utterance immediately: silence the element, drop what has
+   *  been buffered, and clear the idle timer that would otherwise fire a stale
+   *  end-of-reply. The TTS socket is left OPEN — reconnecting costs ~242ms and the
+   *  next turn needs it warm; it simply has nothing more to send.
+   *
+   *  The turn's TEXT is untouched: the reply is already written to the user's chat
+   *  history server-side, and any tool it called has already run. Barge-in cuts the
+   *  audio, it does not undo the turn — that would need a cancel path the backend
+   *  does not have. */
+  private stopSpeaking() {
+    this.speaking = false
+    try { this.audioEl.pause() } catch { /* nothing playing */ }
+    if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = undefined }
+    this.resetAudio()
+  }
+
   // ── Sockets ───────────────────────────────────────────────────────────────
 
-  private sub(): string[] {
-    // The subprotocol IS the credential — see the header note at the top.
-    return [`api-subscription-key.${KEY}`]
+  /** The relay key, as a query fragment. Appended to both speech sockets. */
+  private relayKey(): string {
+    return `k=${encodeURIComponent(getSecret())}`
   }
 
   /** The app's own socket. /chat/stream refuses to generate at all unless this user
@@ -299,7 +373,7 @@ export class LiveVoice {
       silence_duration_ms: String(SILENCE_MS),
     })
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`${STT_WS}?${qs}`, this.sub())
+      const ws = new WebSocket(`${STT_WS}?${qs}&${this.relayKey()}`)
       this.stt = ws
       ws.onopen = () => resolve()
       ws.onerror = () => reject(new Error('STT socket failed to open'))
@@ -311,7 +385,7 @@ export class LiveVoice {
   private openTts(): Promise<void> {
     const qs = new URLSearchParams({ model: 'bulbul:v3' })
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`${TTS_WS}?${qs}`, this.sub())
+      const ws = new WebSocket(`${TTS_WS}?${qs}&${this.relayKey()}`)
       this.tts = ws
       ws.onopen = () => {
         // Pre-warmed and configured once for the whole conversation — a per-turn
@@ -338,6 +412,54 @@ export class LiveVoice {
       case 'transcript.partial':
         if (m.text) this.h.onPartial(m.text)
         break
+      /**
+       * BARGE-IN. Talking over the assistant stops it mid-word, the way a person
+       * would stop when interrupted. Without this the only way to cut a long reply
+       * short is to sit through it.
+       *
+       * Safe here ONLY because the mic is captured with echoCancellation — the
+       * browser subtracts what the speaker is playing, so the assistant's own voice
+       * does not read as the user talking. Turn that constraint off and this becomes
+       * an infinite self-interruption loop: it hears itself, stops, which is silence,
+       * which lets it speak again.
+       *
+       * Speaking-phase only. During 'listening' there is nothing to interrupt, and
+       * during 'thinking' the audio has not started, so stopping would be a no-op
+       * that also threw away a turn already paid for.
+       */
+      case 'vad.speech_start':
+        /**
+         * 🔴 A VAD blip is NOT enough to interrupt, and treating it as enough made
+         * Oscar cut itself off on a phone.
+         *
+         * On a laptop the mic is captured with echoCancellation, so the browser
+         * subtracts what the speaker is playing and Oscar never hears himself. Through
+         * a phone's LOUDSPEAKER that cancellation is far weaker — the mic picks up the
+         * reply, Sarvam's VAD calls it speech, and the audio stopped mid-sentence. The
+         * user experiences a reply that trails off for no reason.
+         *
+         * Two conditions now, and both are needed:
+         *
+         *   • a grace window after playback starts. Echo is loudest exactly when the
+         *     voice begins, and nobody interrupts in the first half second — they have
+         *     not heard enough yet to want to.
+         *   • speech that is still going a moment later. Echo triggers a blip; a person
+         *     talking keeps triggering. Sarvam re-sends speech_start per utterance, so
+         *     a single stray frame no longer counts.
+         *
+         * A real interruption is late and sustained; an echo is early and momentary.
+         */
+        if (this.speaking && performance.now() - this.spokeAt > BARGE_GRACE_MS) {
+          if (this.bargeSeen && performance.now() - this.bargeSeen < BARGE_WINDOW_MS) {
+            this.bargeSeen = 0
+            this.stopSpeaking()
+            this.h.onPhase('listening')
+          } else {
+            this.bargeSeen = performance.now()
+          }
+        }
+        break
+
       case 'vad.speech_end':
         // The user has stopped talking — every latency number is anchored here.
         this.speechEndAt = performance.now()
@@ -376,6 +498,9 @@ export class LiveVoice {
       if (this.t.audioMs === undefined) {
         this.t.audioMs = Math.round(performance.now() - this.turnAnchor)
         this.h.onTimings({ ...this.t })
+        this.speaking = true
+        this.spokeAt = performance.now()
+        this.bargeSeen = 0
         this.h.onPhase('speaking')
       }
       const bin = atob(b)
@@ -383,15 +508,31 @@ export class LiveVoice {
       for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i)
       if (this.useMse) {
         this.pushMse(u8)
-        // Sarvam sends no completion event, so end-of-reply is still detected by
-        // idle — but here it only CLOSES the buffer; playback already started on
-        // chunk one, so this costs nothing.
+        /**
+         * Sarvam sends no completion event, so end-of-reply is detected by idle.
+         *
+         * 🔴 But idle alone is WRONG while the turn is still running, and it silently
+         * truncated every long reply. A long answer is spoken in two pieces — sentence
+         * one while the model is still writing, the rest at chat.complete — and seconds
+         * pass between them. The 250ms timer fired in that gap, called endOfStream(),
+         * and the second piece then had no buffer to append to. Measured symptom: a
+         * 302-character reply where only the first sentence was audible. Short replies
+         * arrive in one burst, which is why this hid for so long.
+         *
+         * So the stream is only closed once the last text has been handed to TTS.
+         */
         if (this.idleTimer) clearTimeout(this.idleTimer)
-        this.idleTimer = setTimeout(() => this.endMse(), IDLE_MS) as unknown as number
+        if (this.textDone) {
+          this.idleTimer = setTimeout(() => this.endMse(), IDLE_MS) as unknown as number
+        }
       } else {
         this.audioChunks.push(u8)
         if (this.idleTimer) clearTimeout(this.idleTimer)
-        this.idleTimer = setTimeout(() => this.flushAudio(), IDLE_MS) as unknown as number
+        // Same rule as the MSE path above — an iPhone takes this branch (no
+        // MediaSource on iOS Safari), so the truncation bug lived here too.
+        if (this.textDone) {
+          this.idleTimer = setTimeout(() => this.flushAudio(), IDLE_MS) as unknown as number
+        }
       }
     }
   }
@@ -494,6 +635,8 @@ export class LiveVoice {
       this.queued = []
     }
     this.busy = true
+    this.speaking = false
+    this.textDone = false
     this.reply = ''
     this.spokenFirst = false; this.spokenFiller = false
     this.t.llmMs = undefined
@@ -593,6 +736,15 @@ export class LiveVoice {
           if (rest) this.speak(rest)
         }
         this.tts?.send(JSON.stringify({ type: 'flush' }))
+        // Everything for this turn is now with TTS, so idle finally MEANS finished.
+        // Arm the timer here as well as on each chunk: if the audio had already
+        // arrived in full, no further chunk would come to arm it and the stream
+        // would stay open forever.
+        this.textDone = true
+        if (this.idleTimer) clearTimeout(this.idleTimer)
+        this.idleTimer = setTimeout(
+          () => (this.useMse ? this.endMse() : this.flushAudio()),
+          IDLE_MS) as unknown as number
         this.turnDone()
         break
       }
