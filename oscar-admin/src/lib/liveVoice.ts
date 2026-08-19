@@ -126,6 +126,11 @@ const BARGE_GRACE_MS = 600
  *  interruption. Echo produces one blip; a person talking keeps producing them. */
 const BARGE_WINDOW_MS = 1200
 
+/** Backstop after the final text is sent: how long to wait for the tail audio to
+ *  begin before giving up on it. Generous on purpose — it should never be what ends a
+ *  healthy reply; the 250ms idle timer does that once audio is flowing. */
+const TTS_TAIL_MS = 6000
+
 const IDLE_MS = 250
 
 export type Phase = 'idle' | 'listening' | 'thinking' | 'speaking'
@@ -736,15 +741,27 @@ export class LiveVoice {
           if (rest) this.speak(rest)
         }
         this.tts?.send(JSON.stringify({ type: 'flush' }))
-        // Everything for this turn is now with TTS, so idle finally MEANS finished.
-        // Arm the timer here as well as on each chunk: if the audio had already
-        // arrived in full, no further chunk would come to arm it and the stream
-        // would stay open forever.
+        /**
+         * Everything for this turn is now with TTS, so socket silence finally MEANS
+         * finished — but only once audio has actually started flowing again.
+         *
+         * 🔴 Arming the 250ms idle timer HERE was wrong and truncated the reply to its
+         * first chunk: at this instant the closing sentences have been SENT to Sarvam
+         * and none of their audio has come back yet. Synthesis takes longer than 250ms,
+         * so the timer fired into that gap and closed the stream before the tail
+         * arrived.
+         *
+         * The timer armed here is therefore a long BACKSTOP, not the idle detector. It
+         * exists only for the case where no further audio ever arrives (a TTS error, a
+         * dropped socket), so the stream cannot stay open forever. Once a chunk does
+         * arrive, the handler above re-arms the real 250ms idle timer and that is what
+         * ends the reply.
+         */
         this.textDone = true
         if (this.idleTimer) clearTimeout(this.idleTimer)
         this.idleTimer = setTimeout(
           () => (this.useMse ? this.endMse() : this.flushAudio()),
-          IDLE_MS) as unknown as number
+          TTS_TAIL_MS) as unknown as number
         this.turnDone()
         break
       }
