@@ -314,7 +314,7 @@ export class LiveVoice {
    *  audio, it does not undo the turn — that would need a cancel path the backend
    *  does not have. */
   private stopSpeaking() {
-    this.speaking = false
+    this.speaking = false          // also the un-mute path for a cancelled reply
     try { this.audioEl.pause() } catch { /* nothing playing */ }
     if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = undefined }
     this.resetAudio()
@@ -549,6 +549,10 @@ export class LiveVoice {
       // One listener for the life of the engine — re-adding per reply would stack
       // handlers and fire the phase change N times.
       this.audioEl.addEventListener('ended', () => {
+        // Playback is genuinely over: re-open the microphone. Without this the
+        // half-duplex gate above would mute the user permanently after the first
+        // reply — a far worse failure than the echo it exists to prevent.
+        this.speaking = false
         this.resetAudio()
         if (this.running) this.h.onPhase('listening')
       })
@@ -624,6 +628,7 @@ export class LiveVoice {
     this.audioEl.src = url
     this.audioEl.onended = () => {
       URL.revokeObjectURL(url)
+      this.speaking = false          // same un-mute as the MSE path — see 'ended' above
       if (this.running) this.h.onPhase('listening')
     }
     void this.audioEl.play().catch(e => {
@@ -825,6 +830,29 @@ export class LiveVoice {
       // whole point of the buffer.
       while (this.pending.length >= framesPer) {
         const frame = Int16Array.from(this.pending.splice(0, framesPer))
+        /**
+         * 🔴 HALF-DUPLEX WHILE SPEAKING. Do not send the microphone upstream while
+         * Oscar is talking.
+         *
+         * The mic stays open through the reply, so the speaker feeds straight back
+         * into it. Sarvam transcribes Oscar's own words as a user utterance, that
+         * utterance ends the current turn and starts a new one, and what the user
+         * experiences is the reply being cut off mid-sentence for no reason. On a
+         * laptop echoCancellation hides most of it; through a phone's loudspeaker it
+         * does not, and every reply is at risk.
+         *
+         * Gating here — at the send — rather than closing the socket keeps the STT
+         * connection warm (reconnecting costs a round trip per turn) and keeps the
+         * frame clock intact. Sarvam simply sees silence, which is the truth: the only
+         * sound in the room is ours.
+         *
+         * The cost is barge-in: you cannot interrupt by voice while this holds, so the
+         * earlier VAD-based interruption is now effectively off during playback. That
+         * is the right trade — an interruption that works sometimes is worth less than
+         * a reply that always finishes. A tap-to-interrupt control is the honest way
+         * back to barge-in and needs no echo heuristics at all.
+         */
+        if (this.speaking) continue
         this.stt.send(JSON.stringify({
           event: 'audio_input', audio: b64(frame),
         }))
