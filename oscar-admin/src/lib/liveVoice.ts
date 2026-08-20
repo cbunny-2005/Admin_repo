@@ -187,6 +187,28 @@ const WAKE_FILLER = ['hey', 'hi', 'hello', 'ok', 'okay', 'yo', 'um', 'uh', 'so',
  */
 const FOLLOWUP_MS = 20000
 
+/**
+ * NOISE GATE — stop paying to transcribe an empty room.
+ *
+ * The socket streams continuously, so Sarvam bills every second the tab is open
+ * (₹30/hour) and transcribes every conversation within earshot. Observed in a real
+ * session: two people talking near the laptop produced fifteen transcripts in ninety
+ * seconds, none of them addressed to the assistant. The wake word stops it ACTING on
+ * them; it does not stop us paying for them.
+ *
+ * A gate on loudness is the cheap fix. It cannot tell speech from noise — only near
+ * from far — but that is the distinction that matters here: the person talking TO the
+ * assistant is next to the microphone, and the room is not.
+ */
+const GATE_RMS = 0.02
+/** Keep streaming for this long after the level drops, so trailing words survive the
+ *  gate closing between syllables. */
+const GATE_HANGOVER_MS = 900
+/** Frames held back while quiet and flushed when the gate opens. Without them the
+ *  first word is always clipped — the gate can only open AFTER sound has arrived, so
+ *  by then its opening syllable is already in the past. */
+const GATE_PREROLL_FRAMES = 3
+
 const IDLE_MS = 250
 
 export type Phase = 'idle' | 'listening' | 'thinking' | 'speaking'
@@ -288,6 +310,10 @@ export class LiveVoice {
   /** Whether that reply asked for something back. Only an invited answer may skip
    *  the wake word; a fresh instruction always needs the name. */
   private lastReplyInvited = false
+  /** Last moment the mic was loud enough to be someone talking to us. */
+  private loudAt = 0
+  /** Recent frames held back while the gate is shut — the pre-roll. */
+  private preroll: Int16Array[] = []
   private spokeAt = 0
   /** When the first unconfirmed speech_start arrived, 0 if none is pending. */
   private bargeSeen = 0
@@ -937,7 +963,10 @@ export class LiveVoice {
 
       let sum = 0
       for (let i = 0; i < input.length; i++) sum += input[i] * input[i]
-      this.h.onLevel(Math.sqrt(sum / input.length))
+      const rms = Math.sqrt(sum / input.length)
+      this.h.onLevel(rms)
+      if (rms >= GATE_RMS) this.loudAt = performance.now()
+      const gateOpen = performance.now() - this.loudAt < GATE_HANGOVER_MS
 
       const pcm = toPcm16(input, ctx.sampleRate)
       for (let i = 0; i < pcm.length; i++) this.pending.push(pcm[i])
@@ -969,6 +998,23 @@ export class LiveVoice {
          * back to barge-in and needs no echo heuristics at all.
          */
         if (this.speaking) continue
+        // Quiet: hold the frame in the pre-roll and send nothing. The buffer is short,
+        // so an idle tab costs nothing and the first word is still not clipped.
+        if (!gateOpen) {
+          this.preroll.push(frame)
+          if (this.preroll.length > GATE_PREROLL_FRAMES) this.preroll.shift()
+          continue
+        }
+        // Gate just opened — flush what was held so the utterance starts intact.
+        if (this.preroll.length) {
+          // Identical payload shape to the live send below — a pre-roll frame that
+          // differs is a frame Sarvam quietly ignores, which would clip exactly the
+          // syllable this buffer exists to preserve.
+          for (const held of this.preroll) {
+            this.stt.send(JSON.stringify({ event: 'audio_input', audio: b64(held) }))
+          }
+          this.preroll = []
+        }
         this.stt.send(JSON.stringify({
           event: 'audio_input', audio: b64(frame),
         }))
