@@ -200,7 +200,23 @@ const FOLLOWUP_MS = 20000
  * from far — but that is the distinction that matters here: the person talking TO the
  * assistant is next to the microphone, and the room is not.
  */
-const GATE_RMS = 0.02
+/**
+ * 🔴 OFF BY DEFAULT, and that default is the point.
+ *
+ * Shipped ON with a guessed threshold of 0.02 RMS and it broke the product: on a mic
+ * quieter than mine the gate never opened, no audio ever reached Sarvam, and the orb
+ * sat in "listening" forever with nothing happening. A cost optimisation that can
+ * silence the assistant is not worth having on by default — the failure looks like a
+ * dead microphone and gives the user nothing to act on.
+ *
+ * Enable with VITE_MIC_GATE=1 once the threshold below is tuned to your room. Watch
+ * the orb while speaking normally: it is driven by the same RMS, and the threshold
+ * wants to sit just under the level you see when talking, comfortably above idle.
+ */
+const GATE_ENABLED = (import.meta.env.VITE_MIC_GATE as string) === '1'
+/** Tunable, because "loud enough to be talking to the mic" is a property of the room
+ *  and the hardware, not something a default can know. */
+const GATE_RMS = Number(import.meta.env.VITE_MIC_GATE_RMS ?? 0.02)
 /** Keep streaming for this long after the level drops, so trailing words survive the
  *  gate closing between syllables. */
 const GATE_HANGOVER_MS = 900
@@ -966,7 +982,9 @@ export class LiveVoice {
       const rms = Math.sqrt(sum / input.length)
       this.h.onLevel(rms)
       if (rms >= GATE_RMS) this.loudAt = performance.now()
-      const gateOpen = performance.now() - this.loudAt < GATE_HANGOVER_MS
+      // Disabled → always open, i.e. exactly the behaviour before the gate existed.
+      const gateOpen = !GATE_ENABLED
+        || performance.now() - this.loudAt < GATE_HANGOVER_MS
 
       const pcm = toPcm16(input, ctx.sampleRate)
       for (let i = 0; i < pcm.length; i++) this.pending.push(pcm[i])
