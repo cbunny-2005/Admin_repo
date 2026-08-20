@@ -106,6 +106,34 @@ const SILENCE_MS = Number(import.meta.env.VITE_VAD_SILENCE_MS ?? 800)
  *  once there is enough to be worth saying. MIN_SPEAK_CHARS stops us shipping "I"
  *  or "Done," as a standalone utterance, which sounds worse than waiting. */
 const MIN_SPEAK_CHARS = 24
+/**
+ * → the message with the name stripped, or null when it was never addressed to us.
+ *
+ * The name must appear in the FIRST FEW WORDS. "Oscar, remind me at four" is addressed
+ * to it; "…so I told Oscar about the meeting" is a sentence about it, and answering
+ * that would be the same class of error as the router matching "hello oscar" inside a
+ * task request. Position is the cheapest available proxy for intent.
+ */
+function wakeStrip(text: string): string | null {
+  const norm = text.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim()
+  const words = norm.split(' ')
+  const at = words.findIndex(w => WAKE_VARIANTS.includes(w))
+  if (at === -1) return null
+  // 🔴 Position alone is not enough. "send hello oscar poster to sriram" has the name
+  // at index 2, and an index test passed it — stripping the first three words and
+  // leaving "poster to sriram", a request that no longer says WHICH poster. The name
+  // of the assistant is also part of a template name, a company name and a greeting.
+  //
+  // So anything before the name must be pure address-filler. "hey oscar" is someone
+  // calling it; "send hello oscar" is someone naming a thing.
+  if (!words.slice(0, at).every(w => WAKE_FILLER.includes(w))) return null
+  // Strip the name and any leading filler it left behind ("Oscar, please …").
+  const rest = words.slice(at + 1).join(' ').replace(/^(please|can you|could you)\s+/, '')
+  // Bare "Oscar" with nothing after it is a summons, not an instruction — let it
+  // through as a greeting so it answers rather than silently doing nothing.
+  return rest.trim() || 'hello'
+}
+
 function firstChunkEnd(s: string): number {
   const sentence = /[.!?](\s|$)/.exec(s)
   if (sentence && sentence.index + 1 >= MIN_SPEAK_CHARS) return sentence.index + 1
@@ -130,6 +158,34 @@ const BARGE_WINDOW_MS = 1200
  *  begin before giving up on it. Generous on purpose — it should never be what ends a
  *  healthy reply; the 250ms idle timer does that once audio is flowing. */
 const TTS_TAIL_MS = 6000
+
+/**
+ * WAKE WORD. With the microphone permanently open, everything said in the room reaches
+ * the agent — a colleague's sentence, the TV, half of a phone call — and any of it can
+ * create a real task on a real calendar. A name is the difference between an assistant
+ * that is listening and one that is merely on.
+ *
+ * Matched against the STT transcript, so the variants matter more than the spelling:
+ * "Oscar" comes back as "oskar", "ascar", "osker" often enough that requiring the exact
+ * word would make the assistant look deaf. Kept deliberately tight all the same — every
+ * entry here is a phrase that can wake it, so a loose one ("ask") would undo the point.
+ */
+const WAKE_WORD = ((import.meta.env.VITE_WAKE_WORD as string) ?? 'oscar').toLowerCase()
+const WAKE_VARIANTS = [WAKE_WORD, 'oskar', 'osker', 'ascar', 'askar', 'auscar', 'ossca']
+/** Words allowed BEFORE the name while still counting as addressing it. Anything else
+ *  in front means the name is being used as a noun, not as a summons. */
+const WAKE_FILLER = ['hey', 'hi', 'hello', 'ok', 'okay', 'yo', 'um', 'uh', 'so', 'excuse', 'me']
+
+/**
+ * How long after a reply you may keep talking WITHOUT the name.
+ *
+ * Without this the assistant is unusable in conversation: it asks "which poster?" and
+ * you would have to answer "Oscar, the hello oscar one". Worse, a staged confirmation
+ * expects a bare "yes" — requiring the name there would strand every destructive action
+ * behind a phrasing nobody would guess. The window opens only after IT has spoken, so
+ * ambient speech in a quiet room still cannot reach the agent.
+ */
+const FOLLOWUP_MS = 20000
 
 const IDLE_MS = 250
 
@@ -227,6 +283,8 @@ export class LiveVoice {
    *  the socket means "the model is still writing", NOT "the reply is over". */
   private textDone = false
   /** When playback of this reply began — the anchor for BARGE_GRACE_MS. */
+  /** When the last reply finished — opens the follow-up window. */
+  private lastReplyAt = 0
   private spokeAt = 0
   /** When the first unconfirmed speech_start arrived, 0 if none is pending. */
   private bargeSeen = 0
@@ -480,13 +538,31 @@ export class LiveVoice {
           this.h.onFinal([...this.queued].join(' '))
           return
         }
+        /**
+         * Addressed to us, or just noise in the room?
+         *
+         * Skipped entirely inside the follow-up window — a reply that just finished is
+         * an open conversation, and demanding the name again there would break both
+         * "which one?" answers and every staged confirmation ("yes").
+         */
+        const openConversation = performance.now() - this.lastReplyAt < FOLLOWUP_MS
+        const addressed = openConversation ? text : wakeStrip(text)
+        if (addressed === null) {
+          // Heard clearly, deliberately not answered. Surfaced rather than swallowed:
+          // silence here is indistinguishable from a broken microphone, and the user
+          // needs to see that it IS listening and chose not to act.
+          this.h.onPartial(`(not addressed to ${WAKE_WORD}) ${text}`)
+          this.h.onPhase('listening')
+          return
+        }
+
         this.turnId += 1
         this.turnAnchor = this.speechEndAt
         this.t = { turn: this.turnId,
                    sttMs: Math.round(performance.now() - this.turnAnchor) }
         this.h.onTimings(this.t)
-        this.h.onFinal(text)
-        void this.ask(text)
+        this.h.onFinal(addressed)
+        void this.ask(addressed)
         break
       }
       case 'error':
@@ -763,6 +839,8 @@ export class LiveVoice {
          * ends the reply.
          */
         this.textDone = true
+        // The conversation is now open: the next sentence needs no name.
+        this.lastReplyAt = performance.now()
         if (this.idleTimer) clearTimeout(this.idleTimer)
         this.idleTimer = setTimeout(
           () => (this.useMse ? this.endMse() : this.flushAudio()),
