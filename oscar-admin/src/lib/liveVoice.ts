@@ -374,6 +374,24 @@ export class LiveVoice {
    *  history server-side, and any tool it called has already run. Barge-in cuts the
    *  audio, it does not undo the turn — that would need a cancel path the backend
    *  does not have. */
+  /**
+   * Interrupt the current reply. PUBLIC — this is the barge-in that voice cannot do.
+   *
+   * The microphone is muted while Oscar speaks (he was transcribing himself and cutting
+   * his own turn short), so a spoken interruption cannot reach us by design. A tap has
+   * no such problem: it is unambiguous, it works on a loudspeaker in a noisy room, and
+   * it needs no echo heuristics at all. Un-mutes as a side effect via stopSpeaking(),
+   * so the next thing you say is heard immediately.
+   */
+  interrupt() {
+    if (!this.speaking) return
+    this.stopSpeaking()
+    this.h.onPhase('listening')
+  }
+
+  /** Whether a reply is currently being spoken — drives the Stop control. */
+  get isSpeaking() { return this.speaking }
+
   private stopSpeaking() {
     this.speaking = false          // also the un-mute path for a cancelled reply
     try { this.audioEl.pause() } catch { /* nothing playing */ }
