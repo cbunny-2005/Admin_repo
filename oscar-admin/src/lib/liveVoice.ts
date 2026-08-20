@@ -285,6 +285,9 @@ export class LiveVoice {
   /** When playback of this reply began — the anchor for BARGE_GRACE_MS. */
   /** When the last reply finished — opens the follow-up window. */
   private lastReplyAt = 0
+  /** Whether that reply asked for something back. Only an invited answer may skip
+   *  the wake word; a fresh instruction always needs the name. */
+  private lastReplyInvited = false
   private spokeAt = 0
   /** When the first unconfirmed speech_start arrived, 0 if none is pending. */
   private bargeSeen = 0
@@ -531,28 +534,41 @@ export class LiveVoice {
       case 'transcript.final': {
         const text = (m.text ?? m.transcript ?? '').trim()
         if (!text) { if (!this.busy) this.h.onPhase('listening'); return }
-        if (this.busy) {
-          // Still answering the previous fragment — hold this one and send it as
-          // part of the next message instead of racing.
-          this.queued.push(text)
-          this.h.onFinal([...this.queued].join(' '))
-          return
-        }
+
         /**
          * Addressed to us, or just noise in the room?
          *
-         * Skipped entirely inside the follow-up window — a reply that just finished is
-         * an open conversation, and demanding the name again there would break both
-         * "which one?" answers and every staged confirmation ("yes").
+         * Checked BEFORE the busy branch, and that ordering is the fix for a hole:
+         * anything said while Oscar was mid-turn used to be pushed onto `queued` and
+         * fired verbatim by turnDone() — never passing through this check at all. So
+         * the one moment the microphone is most likely to hear the room (while the
+         * assistant is talking) was the one moment the wake word did not apply.
+         *
+         * The follow-up exemption is DELIBERATELY NARROW. It first was "any reply
+         * within 20s", which in practice meant the wake word did nothing — during
+         * normal use you always speak within 20s of the last answer, so every
+         * utterance sailed through and the feature looked broken. It now opens only
+         * when the previous reply actually INVITED one: a question, or a staged
+         * confirmation. Answering "which poster?" or "reply confirm to send" must not
+         * require the name; volunteering a new instruction must.
          */
-        const openConversation = performance.now() - this.lastReplyAt < FOLLOWUP_MS
-        const addressed = openConversation ? text : wakeStrip(text)
+        const invited = performance.now() - this.lastReplyAt < FOLLOWUP_MS
+                        && this.lastReplyInvited
+        const addressed = invited ? text : wakeStrip(text)
         if (addressed === null) {
           // Heard clearly, deliberately not answered. Surfaced rather than swallowed:
           // silence here is indistinguishable from a broken microphone, and the user
           // needs to see that it IS listening and chose not to act.
           this.h.onPartial(`(not addressed to ${WAKE_WORD}) ${text}`)
-          this.h.onPhase('listening')
+          if (!this.busy) this.h.onPhase('listening')
+          return
+        }
+
+        if (this.busy) {
+          // Addressed, but we are still answering — hold it and send it with the next
+          // message rather than racing. Already wake-checked above.
+          this.queued.push(addressed)
+          this.h.onFinal([...this.queued].join(' '))
           return
         }
 
@@ -839,8 +855,12 @@ export class LiveVoice {
          * ends the reply.
          */
         this.textDone = true
-        // The conversation is now open: the next sentence needs no name.
+        // Did THIS reply invite an answer? Only then may the next sentence skip the
+        // name. A question mark covers "which poster?"; the phrases cover a staged
+        // confirmation, which asks for a bare "yes" and never ends in a question mark.
         this.lastReplyAt = performance.now()
+        this.lastReplyInvited = /\?\s*$/.test(full.trim())
+          || /\b(confirm|shall i|should i|would you like|yes or no)\b/i.test(full)
         if (this.idleTimer) clearTimeout(this.idleTimer)
         this.idleTimer = setTimeout(
           () => (this.useMse ? this.endMse() : this.flushAudio()),
