@@ -25,7 +25,7 @@ const PHASE_COPY: Record<Phase, string> = {
   idle: 'Tap to start talking',
   listening: 'Listening…',
   thinking: 'Thinking…',
-  speaking: 'Speaking…',
+  speaking: 'Speaking… tap to interrupt',
 }
 
 export function Voice() {
@@ -49,6 +49,15 @@ export function Voice() {
   useEffect(() => () => engine.current?.stop(), [])
 
   const toggle = useCallback(async () => {
+    // Tapping WHILE it is speaking interrupts the reply instead of hanging up. This is
+    // the barge-in that voice cannot provide: the microphone is muted during playback
+    // (Oscar was hearing himself and cutting his own turn short), so a spoken
+    // interruption is impossible by design — a tap is unambiguous, works on a
+    // loudspeaker in a noisy room, and needs no echo heuristics.
+    if (engine.current?.isRunning && engine.current.isSpeaking) {
+      engine.current.interrupt()
+      return
+    }
     if (engine.current?.isRunning) {
       engine.current.stop()
       engine.current = null
@@ -121,7 +130,10 @@ export function Voice() {
           {note && <div className="text-xs text-brand-400">{note}</div>}
           <button
             onClick={toggle}
-            aria-label={live ? 'End call' : 'Start call'}
+            aria-label={phase === 'speaking' ? 'Interrupt' : live ? 'End call' : 'Start call'}
+            title={phase === 'speaking'
+              ? 'Tap to stop the reply — the mic is muted while it speaks, so you cannot interrupt by voice'
+              : live ? 'End call' : 'Start call'}
             className="relative grid size-48 place-items-center rounded-full outline-none"
           >
             {/* Halo — a second ring that only animates while the mic is open. */}
