@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
 import {
-  Camera, GraduationCap, KeyRound, LayoutDashboard, LogOut, MessagesSquare, Phone, RefreshCw, Server, Users,
+  GraduationCap, KeyRound, LayoutDashboard, ListChecks, LogOut, MessagesSquare, RefreshCw, Server, Users,
 } from 'lucide-react'
 import { DEFAULT_BASE, clearCreds, getBase, getSecret, setCreds } from './lib/api'
 import { Card, Field, cx, inputCls } from './ui'
-import { Mcp, Overview, Photos, Sessions, Whatsapp } from './views'
+import { Mcp, Overview, Sessions } from './views'
 import { People } from './people'
 import { Program } from './program'
+import { Tasks } from './tasks'
 
 // `writes` drives the per-page subtitle. Most of this panel reads; People can send a
 // real push and edit an org profile, and a page that can touch a customer's phone
@@ -16,9 +17,10 @@ const NAV = [
   { id: 'people',   label: 'People',    icon: Users,           view: People,   writes: true  },
   // Creates real tasks and posts real comments for the programme cohort.
   { id: 'program',  label: 'Alumnx AI Engineer', icon: GraduationCap, view: Program, writes: true },
-  { id: 'photos',   label: 'Photos & contacts', icon: Camera,  view: Photos,   writes: false },
+  // Every task, filterable, with a per-task audit trail. /admin/overview reports a
+  // task COUNT and nothing else, so this is the only way to look at an individual one.
+  { id: 'tasks',    label: 'Tasks',     icon: ListChecks,      view: Tasks,    writes: false },
   { id: 'sessions', label: 'Sessions',  icon: MessagesSquare,  view: Sessions, writes: false },
-  { id: 'whatsapp', label: 'WhatsApp',  icon: Phone,           view: Whatsapp, writes: false },
   { id: 'mcp',      label: 'MCP config', icon: Server,         view: Mcp,      writes: false },
 ] as const
 
