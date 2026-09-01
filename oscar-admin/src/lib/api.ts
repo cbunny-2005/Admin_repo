@@ -29,7 +29,21 @@ export const DEFAULT_BASE =
   (import.meta.env.VITE_ADMIN_BASE as string | undefined)?.replace(/\/+$/, '') ||
   (_isLocalhost ? LOCAL_BASE : DEPLOYED_BASE)
 
-export const getBase = () => localStorage.getItem(LS_URL) || DEFAULT_BASE
+/**
+ * The backend this panel talks to.
+ *
+ * VITE_ADMIN_BASE WINS over the stored value, and that ordering is the whole point:
+ * localStorage outlives a deploy, so a URL typed once (or carried over from a
+ * previous deployment) kept overriding the configured backend forever, and the only
+ * symptom was a connection error pointing at a host nobody had chosen. A build that
+ * declares its backend should not be second-guessed by a browser's leftovers.
+ *
+ * Without VITE_ADMIN_BASE the stored value still applies, so "Use a different
+ * backend" keeps working for a local checkout.
+ */
+export const getBase = () =>
+  (import.meta.env.VITE_ADMIN_BASE as string | undefined)?.replace(/\/+$/, '') ||
+  localStorage.getItem(LS_URL) || DEFAULT_BASE
 export const getSecret = () => localStorage.getItem(LS_SECRET) || ''
 export const setCreds = (base: string, secret: string) => {
   localStorage.setItem(LS_URL, base.replace(/\/+$/, ''))
