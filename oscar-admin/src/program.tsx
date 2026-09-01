@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { CheckCircle2, ChevronLeft, FileText, Loader2, MessageSquare, Paperclip, Send, UserPlus, Users, X } from 'lucide-react'
+import { CheckCircle2, ChevronLeft, FileText, Loader2, MessageSquare, Paperclip, Send, Users, X } from 'lucide-react'
 import type { TaskAttachment } from './lib/api'
 import { ATTACH_EXTS, ATTACH_MAX_BYTES, api, attUrl, prettyBytes, send, upload } from './lib/api'
 import { Badge, Card, ErrorBox, Field, Spinner, cx, inputCls } from './ui'
@@ -95,8 +95,7 @@ export function Program() {
 
   if (open) {
     return (
-      <Thread task={open} leadId={lead.user_id} members={members}
-              onChanged={t => { setOpen({ ...open, ...t }); void load() }}
+      <Thread task={open} leadId={lead.user_id}
               onBack={() => { setOpen(null); void load() }} />
     )
   }
@@ -539,12 +538,10 @@ function TaskList({ tasks, leadId, onOpen, onChanged }: {
 
 // ── Thread ──────────────────────────────────────────────────────────────────
 
-function Thread({ task, leadId, members, onBack, onChanged }: {
-  task: Task; leadId: number; members: Member[]
-  onBack: () => void; onChanged: (t: Task) => void
+function Thread({ task, leadId, onBack }: {
+  task: Task; leadId: number; onBack: () => void
 }) {
   const [comments, setComments] = useState<Comment[] | null>(null)
-  const [adding, setAdding] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [body, setBody] = useState('')
   const [busy, setBusy] = useState(false)
@@ -632,22 +629,6 @@ function Thread({ task, leadId, members, onBack, onChanged }: {
   const total = task.assignee_count ?? 1
   const done = task.completed_count ?? 0
   const roster = task.assignees ?? []
-  const assignedIds = new Set(roster.map(a => a.user_id))
-  // Team members not on this task yet. The lead is excluded: they are assigning, not
-  // doing, and adding them would hold the task open until they "completed" it too.
-  const missing = members.filter(m => m.user_id !== leadId && !assignedIds.has(m.user_id))
-
-  /** Add everyone on the team who is not already on the task. Uses the same
-   *  server-side expansion as creation, so it cannot miss a late joiner. */
-  async function addEveryone() {
-    setAdding(true)
-    try {
-      const r = await send<{ task: Task }>(`/items/${task.id}`, 'PATCH',
-                                          { user_id: leadId, assign_to_all_members: true })
-      if (r?.task) onChanged(r.task)
-    } catch (e) { setError((e as Error).message) } finally { setAdding(false) }
-  }
-
   return (
     <div className="space-y-6">
       <button onClick={onBack} className="flex items-center gap-1 text-sm text-ink-600 hover:text-ink-300">
@@ -678,15 +659,6 @@ function Thread({ task, leadId, members, onBack, onChanged }: {
                 Assigned to {task.assignees_truncated
                   ? `(${total} people — list capped by the server)` : `(${total})`}
               </span>
-              {missing.length > 0 && (
-                <button onClick={addEveryone} disabled={adding}
-                        className="flex items-center gap-1.5 rounded-lg bg-white/5 px-2.5 py-1
-                                   text-xs font-semibold hover:bg-white/10 disabled:opacity-50">
-                  {adding ? <Loader2 className="size-3.5 animate-spin" />
-                          : <UserPlus className="size-3.5" />}
-                  Add {missing.length} missing
-                </button>
-              )}
             </div>
             <div className="flex flex-wrap gap-1.5">
               {[...roster]
@@ -704,12 +676,6 @@ function Thread({ task, leadId, members, onBack, onChanged }: {
                   </span>
                 ))}
             </div>
-            {missing.length > 0 && (
-              <p className="mt-2 text-xs text-amber-500/90">
-                {missing.length} team member{missing.length > 1 ? 's are' : ' is'} NOT on this
-                task: {missing.map(m => m.name).join(', ')}
-              </p>
-            )}
           </div>
         )}
 
