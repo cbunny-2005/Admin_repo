@@ -44,6 +44,16 @@ const BADGE_TONES: Record<string, string> = {
   env: 'bg-amber-500/12 text-amber-300 ring-amber-500/25',
   none: 'bg-ink-600/40 text-ink-400 ring-ink-600',
   on: 'bg-brand-500/15 text-brand-400 ring-brand-500/30',
+  // Task status + the two priority tiers. Keyed by the exact word the API returns
+  // so a Badge needs no tone prop and cannot drift from the backend's vocabulary.
+  pending: 'bg-brand-500/12 text-brand-400 ring-brand-500/25',
+  in_progress: 'bg-amber-500/12 text-amber-300 ring-amber-500/25',
+  completed: 'bg-emerald-500/12 text-emerald-300 ring-emerald-500/25',
+  cancelled: 'bg-ink-600/40 text-ink-400 ring-ink-600',
+  blocked: 'bg-rose-500/12 text-rose-300 ring-rose-500/25',
+  critical: 'bg-rose-500/12 text-rose-300 ring-rose-500/25',
+  normal: 'bg-ink-600/40 text-ink-300 ring-ink-600',
+  team: 'bg-sky-500/12 text-sky-300 ring-sky-500/25',
 }
 
 export function Badge({ children, tone }: { children: ReactNode; tone?: string }) {

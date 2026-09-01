@@ -1,11 +1,9 @@
 import { useState } from 'react'
-import { Camera, ChevronRight, Search, X } from 'lucide-react'
+import { ChevronRight, X } from 'lucide-react'
 import { useApi } from './useApi'
 import { imgUrl } from './lib/api'
-import type { McpRow, Overview as O, PhotoRow, SessionRow, TranscriptAtt, TranscriptMsg, WaRow } from './lib/api'
-import { Badge, Card, Empty, ErrorBox, Spinner, Stat, Table, Td, inputCls } from './ui'
-
-const pct = (n: number, d: number) => (d ? Math.round((n / d) * 100) : 0)
+import type { McpRow, Overview as O, SessionRow, TranscriptAtt, TranscriptMsg } from './lib/api'
+import { Badge, Card, Empty, ErrorBox, Spinner, Stat, Table, Td } from './ui'
 
 // ── Overview ────────────────────────────────────────────────────────────────
 
@@ -20,126 +18,13 @@ export function Overview() {
         <Stat label="Users" value={data.users} sub={`${data.active_users} active`} />
         <Stat label="Teams" value={data.teams} sub={`${data.org_mcps} with an MCP`} />
         <Stat label="Chat sessions" value={data.sessions} sub={`${data.messages} messages`} />
-        <Stat label="Photos" value={data.photos} tone="brand" sub={`${data.photos_with_contact} with a contact`} />
-      </div>
-
-      {/* The funnel the photo→contact feature is judged by. A photo stuck at
-          "awaiting details" is the state Oscar is supposed to ask about, so a big
-          number here is a signal about the agent, not just a statistic. */}
-      <Card className="p-6 rise">
-        <div className="flex items-center gap-2 text-sm font-semibold">
-          <Camera className="size-4 text-brand-400" /> Photo → contact funnel
-        </div>
-        <div className="mt-5 space-y-4">
-          {[
-            { k: 'Uploaded', v: data.photos, c: 'bg-brand-500' },
-            { k: 'Has details (business / context)', v: data.photos_with_details, c: 'bg-sky-500' },
-            { k: 'Has a stored contact', v: data.photos_with_contact, c: 'bg-emerald-500' },
-          ].map(r => (
-            <div key={r.k}>
-              <div className="mb-1.5 flex items-baseline justify-between gap-3 text-sm">
-                <span className="text-ink-300">{r.k}</span>
-                <span className="tabular-nums text-ink-400">
-                  <span className="font-semibold text-ink-100">{r.v}</span>
-                  <span className="ml-2 text-xs">{pct(r.v, data.photos)}%</span>
-                </span>
-              </div>
-              <div className="h-2 overflow-hidden rounded-full bg-ink-800">
-                <div className={`h-full rounded-full ${r.c} transition-[width] duration-700`}
-                     style={{ width: `${pct(r.v, data.photos)}%` }} />
-              </div>
-            </div>
-          ))}
-        </div>
-        <div className="mt-5 flex flex-wrap gap-2 border-t border-ink-700/60 pt-4">
-          <Badge tone="awaiting_details">{data.awaiting_details} awaiting details</Badge>
-          <Badge tone="awaiting_contact">{data.awaiting_contact} awaiting contact</Badge>
-          {Object.entries(data.contacts_by_source).map(([k, v]) => (
-            <Badge key={k} tone={k}>{v} × {k}</Badge>
-          ))}
-        </div>
-      </Card>
-
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Stat label="Tasks" value={data.tasks} />
-        <Stat label="Meetings" value={data.meetings} />
-        <Stat label="WhatsApp directory" value={data.whatsapp_contacts} />
         <Stat label="Active sessions" value={data.active_sessions} />
       </div>
-    </div>
-  )
-}
 
-// ── Photos & contacts ───────────────────────────────────────────────────────
-
-export function Photos() {
-  const [state, setState] = useState('')
-  const [uid, setUid] = useState('')
-  const q = new URLSearchParams({ limit: '100' })
-  if (state) q.set('state', state)
-  if (uid) q.set('user_id', uid)
-  const { data, error, loading, reload } = useApi<{ count: number; rows: PhotoRow[] }>(
-    `/admin/photo-contacts?${q}`, [state, uid])
-
-  return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-end gap-3">
-        <div className="flex gap-1 rounded-xl border border-ink-700 bg-ink-900/60 p-1">
-          {[['', 'All'], ['awaiting_details', 'Awaiting details'],
-            ['awaiting_contact', 'Awaiting contact'], ['complete', 'Complete']].map(([v, l]) => (
-            <button key={v} onClick={() => setState(v)}
-              className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
-                state === v ? 'bg-brand-500/15 text-brand-400' : 'text-ink-400 hover:text-ink-100'}`}>
-              {l}
-            </button>
-          ))}
-        </div>
-        <div className="relative">
-          <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-ink-600" />
-          <input value={uid} onChange={e => setUid(e.target.value.replace(/\D/g, ''))}
-                 placeholder="user id" className={inputCls + ' w-32 pl-8'} />
-        </div>
-        {data && <span className="ml-auto text-xs text-ink-400">{data.count} rows</span>}
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <Stat label="Tasks" value={data.tasks} tone="brand" />
+        <Stat label="Meetings" value={data.meetings} />
       </div>
-
-      {loading && <Spinner />}
-      {error && <ErrorBox error={error} onRetry={reload} />}
-      {data && (
-        <Card className="overflow-hidden rise">
-          <Table head={['Photo', 'User', 'Session', 'Business / context', 'Contact', 'Source', 'State']}>
-            {data.rows.map(r => (
-              <tr key={r.photo_id} className="hover:bg-ink-800/40 transition">
-                <Td>
-                  {/* Thumbnails are best-effort server-side: a failed generation
-                      leaves thumb_key NULL and the route falls back to the original.
-                      onError keeps a genuinely broken image from breaking the row. */}
-                  <img src={imgUrl(r.thumbnail_url)} alt=""
-                       className="size-11 rounded-lg object-cover ring-1 ring-ink-700"
-                       onError={e => { (e.target as HTMLImageElement).style.visibility = 'hidden' }} />
-                </Td>
-                <Td><div className="text-sm">{r.user_name ?? <Empty />}</div>
-                    <div className="font-mono text-[11px] text-ink-400">#{r.user_id}</div></Td>
-                <Td><div className="max-w-40 truncate text-xs text-ink-300">{r.session_title ?? <Empty />}</div>
-                    <div className="font-mono text-[11px] text-ink-400">#{r.session_id ?? '—'}</div></Td>
-                <Td>
-                  <div className="text-sm">{r.business_name ?? <Empty />}</div>
-                  <div className="max-w-64 truncate text-[11px] text-ink-400">{r.context ?? ''}</div>
-                </Td>
-                <Td>
-                  <div className="text-sm">{r.contact_name ?? <Empty />}</div>
-                  <div className="font-mono text-[11px] text-ink-400">{r.contact_phone ?? ''}</div>
-                </Td>
-                <Td>{r.contact_source ? <Badge tone={r.contact_source}>{r.contact_source}</Badge>
-                    : <span className="text-[11px] text-ink-600">unknown</span>}</Td>
-                <Td><Badge tone={r.state}>{r.state.replace('_', ' ')}</Badge></Td>
-              </tr>
-            ))}
-          </Table>
-          {data.rows.length === 0 && (
-            <div className="py-14 text-center text-sm text-ink-400">Nothing matches that filter.</div>
-          )}
-        </Card>
-      )}
     </div>
   )
 }
@@ -242,59 +127,6 @@ function Transcript({ sessionId, onClose }: { sessionId: number; onClose: () => 
           ))}
         </div>
       </div>
-    </div>
-  )
-}
-
-// ── WhatsApp directory ──────────────────────────────────────────────────────
-
-export function Whatsapp() {
-  const { data, error, loading, reload } = useApi<{
-    count: number; rows: WaRow[]; by_label: Record<string, number>
-  }>('/admin/whatsapp-contacts?limit=500')
-
-  return (
-    <div className="space-y-4">
-      {loading && <Spinner />}
-      {error && <ErrorBox error={error} onRetry={reload} />}
-      {data && (
-        <>
-          {/* Labels matter more than they look: _labels_match matches on substring
-              AND per-token prefix in both directions, so two labels sharing a
-              leading word make one "send to X" reach both groups — unrecallably. */}
-          <Card className="p-5 rise">
-            <div className="text-[11px] font-medium uppercase tracking-[.14em] text-ink-400">
-              Labels — what a broadcast reaches
-            </div>
-            <div className="mt-3 flex flex-wrap gap-2">
-              {Object.entries(data.by_label).map(([l, n]) => (
-                <Badge key={l}>{l} · {n}</Badge>
-              ))}
-            </div>
-            {Object.keys(data.by_label).filter(l => l !== '(none)').length > 1 && (
-              <div className="mt-3 text-xs text-amber-300/90">
-                More than one label in use — check none share a leading word, or a single
-                send can reach both groups.
-              </div>
-            )}
-          </Card>
-
-          <Card className="overflow-hidden rise">
-            <Table head={['#', 'Name', 'Phone', 'Label', 'Team', 'Owner']}>
-              {data.rows.map(r => (
-                <tr key={r.id} className="hover:bg-ink-800/40 transition">
-                  <Td className="font-mono text-xs text-ink-400">{r.id}</Td>
-                  <Td className="text-sm">{r.display_name}</Td>
-                  <Td className="font-mono text-xs">{r.phone_number}</Td>
-                  <Td>{r.label ? <Badge>{r.label}</Badge> : <Empty />}</Td>
-                  <Td className="text-xs text-ink-300">{r.team_name ?? <Empty />}</Td>
-                  <Td className="text-xs text-ink-400">{r.owner_name ?? `#${r.owner_user_id}`}</Td>
-                </tr>
-              ))}
-            </Table>
-          </Card>
-        </>
-      )}
     </div>
   )
 }
