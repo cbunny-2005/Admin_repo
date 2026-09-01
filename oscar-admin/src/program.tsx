@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { CheckCircle2, ChevronLeft, Loader2, MessageSquare, Send, Users } from 'lucide-react'
-import { api, send } from './lib/api'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { CheckCircle2, ChevronLeft, FileText, Loader2, MessageSquare, Paperclip, Send, UserPlus, Users, X } from 'lucide-react'
+import type { TaskAttachment } from './lib/api'
+import { ATTACH_EXTS, ATTACH_MAX_BYTES, api, attUrl, prettyBytes, send, upload } from './lib/api'
 import { Badge, Card, ErrorBox, Field, Spinner, cx, inputCls } from './ui'
 
 /**
@@ -27,15 +28,24 @@ const TEAM_ID = Number(import.meta.env.VITE_PROGRAM_TEAM_ID ?? 65)
 type Member = {
   user_id: number; name: string; role: string; online?: boolean
 }
+type Assignee = {
+  user_id: number; name: string | null
+  status: 'completed' | 'pending'; completed_at?: string | null
+}
 type Task = {
   id: number; title: string; description?: string | null; status: string
   due_at?: string | null; due_label?: string; is_overdue?: boolean
   assignee_count?: number; completed_count?: number; pending_count?: number
   owner_name?: string; assigned_to_name?: string
+  // Per-person completion state. Capped server-side at 25, so on a very large task
+  // this is the caller's own row only — assignees_truncated says which.
+  assignees?: Assignee[]; assignees_truncated?: boolean
 }
 type Comment = {
   id: number; user_id: number; user_name?: string; role: string
   body: string; created_at?: string
+  // Present since the 2026-08-18 backend; absent on an older deployment, hence optional.
+  attachments?: TaskAttachment[]
 }
 
 /** `datetime-local` gives "YYYY-MM-DDTHH:MM"; the backend stores IST-naive seconds. */
@@ -68,7 +78,12 @@ export function Program() {
         api<{ tasks: Task[] }>(`/teams/${TEAM_ID}/tasks?project=true`),
       ])
       setMembers(ms)
-      setTasks(ts.tasks ?? [])
+      // Cancelled tasks are NOT dropped by the API — GET /teams/{id}/tasks?project=true
+      // returns every status, so three cancelled tasks sat in this list looking active
+      // (no strikethrough, no badge) and someone tried to cancel them again to no effect.
+      // A cancelled task is not part of the programme any more; hide it here rather than
+      // deleting rows, so the comment threads survive.
+      setTasks((ts.tasks ?? []).filter(t => t.status !== 'cancelled'))
     } catch (e) { setError((e as Error).message) }
   }, [])
 
@@ -79,13 +94,17 @@ export function Program() {
   if (!lead) return <ErrorBox error={`Team ${TEAM_ID} has no active team_lead — a task needs an owner.`} />
 
   if (open) {
-    return <Thread task={open} leadId={lead.user_id} onBack={() => { setOpen(null); void load() }} />
+    return (
+      <Thread task={open} leadId={lead.user_id} members={members}
+              onChanged={t => { setOpen({ ...open, ...t }); void load() }}
+              onBack={() => { setOpen(null); void load() }} />
+    )
   }
 
   return (
     <div className="space-y-6">
       <Compose members={members} leadId={lead.user_id} onDone={load} />
-      <TaskList tasks={tasks} onOpen={setOpen} />
+      <TaskList tasks={tasks} leadId={lead.user_id} onOpen={setOpen} onChanged={load} />
     </div>
   )
 }
@@ -106,6 +125,34 @@ function Compose({ members, leadId, onDone }: {
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [progress, setProgress] = useState(0)
+  // Held as raw Files, NOT uploaded yet. The upload route needs an item_id and the
+  // tasks do not exist until Send — so unlike the Thread composer (which uploads on
+  // pick), these can only go up once each person's task has been created.
+  const [files, setFiles] = useState<File[]>([])
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  /** Same whitelist and cap the server enforces — checked here only so a bad file is
+   *  caught before it is uploaded N times. */
+  function pickFiles(list: FileList | null) {
+    if (!list) return
+    const ok: File[] = []
+    for (const f of Array.from(list)) {
+      const ext = f.name.includes('.') ? f.name.split('.').pop()!.toLowerCase() : ''
+      if (!(ATTACH_EXTS as readonly string[]).includes(ext)) {
+        setErr(`${f.name}: unsupported file type — allowed: ${ATTACH_EXTS.join(', ')}`); continue
+      }
+      if (f.size > ATTACH_MAX_BYTES) {
+        setErr(`${f.name}: too large (${prettyBytes(f.size)}); limit is ${prettyBytes(ATTACH_MAX_BYTES)}`); continue
+      }
+      ok.push(f)
+    }
+    if (ok.length) setFiles(fs => [...fs, ...ok])
+    if (fileRef.current) fileRef.current.value = ''
+  }
+
+  const dropFile = (i: number) => setFiles(fs => fs.filter((_, n) => n !== i))
+  const filesBytes = files.reduce((n, f) => n + f.size, 0)
 
   const toggle = (id: number) => setPicked(s => {
     const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n
@@ -114,34 +161,82 @@ function Compose({ members, leadId, onDone }: {
   const count = all ? assignable.length : picked.size
   const canSend = title.trim() && due && count > 0 && !busy
 
+  /**
+   * ONE TASK PER PERSON, created iteratively.
+   *
+   * The backend also supports a single shared row with per-person assignee rows
+   * (assigned_to_user_ids / assign_to_all_members), and that is still what the Flutter
+   * app produces. This panel deliberately does NOT use it: on a shared row, closing the
+   * ITEM locks every remaining assignee out of ticking their own share, because
+   * complete_item early-returns once item.status == 'completed'. One row per person
+   * cannot hit that — each task has exactly one owner of its own state.
+   *
+   * The count you want (4/25) is reconstructed in the list by grouping on title + due
+   * date, so nothing is lost by fanning out. No backend change: this is N calls to the
+   * same POST /items the app already uses.
+   *
+   * Sequential on purpose. 25 concurrent POSTs against a single-worker uvicorn is a good
+   * way to make the whole backend feel broken for everyone actually using the app, and
+   * each call writes a row plus fires a notification.
+   */
   async function submit() {
     setBusy(true); setErr(null); setMsg(null)
+    const targets = all ? assignable.map(m => m.user_id) : [...picked]
+    const made: number[] = []
+    const failed: { id: number; why: string }[] = []
     try {
-      const body: Record<string, unknown> = {
-        user_id: leadId,
-        title: title.trim(),
-        due_at: toDueAt(due),
-        priority,
-        description: desc.trim() || undefined,
-        is_project: true,
+      for (const uid of targets) {
+        const body: Record<string, unknown> = {
+          user_id: leadId,
+          title: title.trim(),
+          due_at: toDueAt(due),
+          priority,
+          description: desc.trim() || undefined,
+          is_project: true,
+          assigned_to_user_id: uid,
+        }
+        try {
+          const res = await send<{ task: Task }>('/items', 'POST', body)
+          const task = res?.task
+          if (!task) throw new Error('no task returned')
+          made.push(task.id)
+          // Files are uploaded PER TASK — the row carries item_id NOT NULL, so one
+          // attachment cannot be shared across 43 people's tasks. That is the real
+          // price of fanning out: the same PDF is stored once per person. Sequential
+          // for the same reason the task loop is (single-worker uvicorn).
+          const attIds: number[] = []
+          for (const f of files) {
+            try {
+              const a = await upload<TaskAttachment>(
+                `/users/${leadId}/tasks/${task.id}/attachments`, f)
+              attIds.push(a.id)
+            } catch (e) {
+              // A failed upload must not cost the person their task or the text of
+              // the comment — record it and post what we have.
+              failed.push({ id: uid, why: `${f.name}: ${(e as Error).message}` })
+            }
+          }
+          if (comment.trim() || attIds.length) {
+            // Per task, because each person now has their own thread. This is the real
+            // cost of fanning out — the Trainer Central link has to be posted N times
+            // rather than once on a shared row.
+            await send(`/users/${leadId}/tasks/${task.id}/comments`, 'POST',
+                       { body: comment.trim(), attachment_ids: attIds })
+          }
+        } catch (e) {
+          // One failure must not lose the other 24. Report which, do not silently skip.
+          failed.push({ id: uid, why: (e as Error).message })
+        }
+        setProgress(made.length + failed.length)
       }
-      // "All" is a server-side expansion, not a list built here — so anyone who
-      // joins between loading this page and pressing send is still included.
-      if (all) body.assign_to_all_members = true
-      else body.assigned_to_user_ids = [...picked]
 
-      const res = await send<{ task: Task }>('/items', 'POST', body)
-      const task = res?.task
-      if (!task) throw new Error('no task returned')
-
-      if (comment.trim()) {
-        await send(`/users/${leadId}/tasks/${task.id}/comments`, 'POST',
-                   { body: comment.trim() })
-      }
-      setMsg(`Task #${task.id} created for ${task.assignee_count ?? count} people.`)
-      setTitle(''); setDesc(''); setComment(''); setPicked(new Set())
+      if (!made.length) throw new Error(failed[0]?.why ?? 'nothing was created')
+      setMsg(`Created ${made.length} task${made.length === 1 ? '' : 's'}` +
+             (failed.length ? ` — ${failed.length} FAILED (${failed.map(f => f.id).join(', ')})`
+                            : ' — one per person.'))
+      setTitle(''); setDesc(''); setComment(''); setPicked(new Set()); setFiles([])
       onDone()
-    } catch (e) { setErr((e as Error).message) } finally { setBusy(false) }
+    } catch (e) { setErr((e as Error).message) } finally { setBusy(false); setProgress(0) }
   }
 
   return (
@@ -208,11 +303,54 @@ function Compose({ members, leadId, onDone }: {
                   onChange={e => setComment(e.target.value)}
                   placeholder="Posted as the lead, right after the task is created" />
       </Field>
-      {/* Said here rather than in a doc, because putting the Meet link in a comment
-          and locking most of the cohort out of it has already happened twice. */}
-      <p className="-mt-3 text-xs text-amber-500/90">
-        Comments are readable by the owner and the primary assignee only. Anything
-        everyone must see belongs in the description.
+      {/* Attachments ride on that first comment — the ONLY place the backend accepts
+          a file. There is no attachment on the task itself, so a spec sheet has to be
+          posted as a comment. */}
+      <div className="-mt-2">
+        <input ref={fileRef} type="file" multiple className="hidden"
+               accept={ATTACH_EXTS.map(e => '.' + e).join(',')}
+               onChange={e => pickFiles(e.target.files)} />
+        <button type="button" onClick={() => fileRef.current?.click()} disabled={busy}
+                className="flex items-center gap-2 rounded-xl bg-white/5 px-3 py-2 text-xs
+                           font-semibold text-ink-300 hover:bg-white/10 disabled:opacity-50">
+          <Paperclip className="size-3.5" />
+          Attach files
+        </button>
+
+        {files.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-2">
+            {files.map((f, i) => (
+              <span key={`${f.name}-${i}`}
+                    className="flex items-center gap-2 rounded-lg bg-white/5 px-2.5 py-1.5 text-xs">
+                <FileText className="size-3.5 shrink-0 text-ink-400" />
+                <span className="max-w-[16rem] truncate">{f.name}</span>
+                <span className="tabular-nums text-ink-600">{prettyBytes(f.size)}</span>
+                <button type="button" onClick={() => dropFile(i)}
+                        className="text-ink-600 hover:text-rose-300">
+                  <X className="size-3.5" />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Said plainly, because it is a surprise: an attachment belongs to ONE task,
+            so N people means N uploads of the same bytes and a visibly slower Send. */}
+        {files.length > 0 && count > 0 && (
+          <p className="mt-2 text-xs text-amber-500/90">
+            {files.length} file{files.length > 1 ? 's' : ''} × {count} {count === 1 ? 'person' : 'people'} ={' '}
+            {files.length * count} uploads ({prettyBytes(filesBytes * count)}) — each person's
+            task gets its own copy. This makes Send take a while; leave the tab open.
+          </p>
+        )}
+      </div>
+
+      {/* Every assignee can read the thread as of the comment-access fix. The
+          description is still the better place for the material itself — a comment is
+          a reply, not the brief. */}
+      <p className="-mt-1 text-xs text-ink-600">
+        Everyone assigned can read the comments. Only the owner and the primary
+        assignee are notified of new ones.
       </p>
 
       {err && <ErrorBox error={err} />}
@@ -223,7 +361,7 @@ function Compose({ members, leadId, onDone }: {
                 canSend ? 'bg-brand-500 text-white hover:bg-brand-600'
                         : 'bg-white/5 text-ink-600')}>
         {busy ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
-        {busy ? 'Creating…' : `Create & assign to ${count}`}
+        {busy ? `Creating ${progress}/${count}…` : `Create & assign to ${count}`}
       </button>
     </Card>
   )
@@ -231,35 +369,167 @@ function Compose({ members, leadId, onDone }: {
 
 // ── Task list ───────────────────────────────────────────────────────────────
 
-function TaskList({ tasks, onOpen }: { tasks: Task[]; onOpen: (t: Task) => void }) {
+/**
+ * One row per PERSON is what gets created, so 25 people means 25 tasks. Showing 25
+ * near-identical rows would be unreadable, so identical work is grouped back together
+ * here — same title, same due time — and the count is derived from the group.
+ *
+ * Grouping on (title, due_at) rather than an id: there is no batch id on the row, and
+ * adding one would be a schema change. The trade-off is honest and worth stating — two
+ * genuinely separate tasks that share a title AND a due minute would merge in this view.
+ * In practice that only happens when you assign the same thing twice by mistake, which
+ * is a thing you want to see merged anyway.
+ *
+ * A shared-row task from the Flutter app still renders correctly: it arrives as a single
+ * row carrying assignee_count/completed_count, so its group is one row and the count
+ * comes from the server instead of the group size.
+ */
+type Group = {
+  key: string; title: string; due: string; ids: number[]
+  total: number; done: number; overdue: boolean
+  hasDescription: boolean; sample: Task
+}
+
+function groupTasks(tasks: Task[]): Group[] {
+  const by = new Map<string, Task[]>()
+  for (const t of tasks) {
+    const key = `${t.title.trim().toLowerCase()}|${t.due_at ?? ''}`
+    const arr = by.get(key)
+    arr ? arr.push(t) : by.set(key, [t])
+  }
+  return [...by.entries()].map(([key, ts]) => {
+    const server = ts.length === 1 && (ts[0].assignee_count ?? 0) > 1
+    return {
+      key,
+      title: ts[0].title,
+      due: ts[0].due_label ?? ts[0].due_at ?? 'no due date',
+      ids: ts.map(t => t.id),
+      // A shared row reports its own counts; a fanned-out group counts its members.
+      total: server ? (ts[0].assignee_count ?? 1) : ts.length,
+      done: server
+        ? (ts[0].completed_count ?? 0)
+        : ts.filter(t => t.status === 'completed').length,
+      overdue: ts.some(t => t.is_overdue),
+      hasDescription: !!ts[0].description,
+      sample: ts[0],
+    }
+  })
+}
+
+function TaskList({ tasks, leadId, onOpen, onChanged }: {
+  tasks: Task[]; leadId: number; onOpen: (t: Task) => void; onChanged: () => void
+}) {
+  const groups = useMemo(() => groupTasks(tasks), [tasks])
+  const [busyKey, setBusyKey] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState<string | null>(null)
+
+  /**
+   * Mark every task in the group complete — the bulk action for a fanned-out batch.
+   *
+   * Sequential, and it skips the ones already done rather than re-sending: complete_item
+   * is idempotent, but each call still costs a round trip and can fire a notification.
+   */
+  async function completeGroup(g: Group) {
+    setBusyKey(g.key); setErr(null)
+    const pending = tasks.filter(t => g.ids.includes(t.id) && t.status !== 'completed')
+    let failed = 0
+    for (const t of pending) {
+      // user_id is a QUERY param on this route, not a body field. Sending it in the
+      // body returns 422 — which is exactly what the first version of this did.
+      try {
+        await send(`/items/${t.id}/complete?user_id=${leadId}`, 'PATCH')
+      } catch { failed++ }
+    }
+    setBusyKey(null)
+    if (failed) setErr(`${failed} of ${pending.length} could not be completed.`)
+    onChanged()
+  }
+
   if (!tasks.length) {
     return <Card className="p-6 text-sm text-ink-600">No tasks yet for this programme.</Card>
   }
   return (
     <Card className="p-6">
-      <div className="text-sm font-semibold">Tasks ({tasks.length})</div>
+      <div className="flex items-baseline gap-2">
+        <div className="text-sm font-semibold">Tasks ({groups.length})</div>
+        {groups.length !== tasks.length && (
+          <span className="text-xs text-ink-600">
+            {tasks.length} rows, one per person
+          </span>
+        )}
+      </div>
+      {err && <div className="mt-3"><ErrorBox error={err} /></div>}
       <div className="mt-4 space-y-2">
-        {tasks.map(t => {
-          const total = t.assignee_count ?? 1
-          const done = t.completed_count ?? (t.status === 'completed' ? 1 : 0)
+        {groups.map(g => {
+          const allDone = g.done >= g.total
           return (
-            <button key={t.id} onClick={() => onOpen(t)}
-                    className="flex w-full items-center gap-3 rounded-xl bg-white/5 px-4 py-3 text-left hover:bg-white/10">
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-semibold">{t.title}</div>
-                <div className="mt-0.5 truncate text-xs text-ink-600">
-                  #{t.id} · {t.due_label ?? t.due_at ?? 'no due date'}
-                  {t.description ? ' · has description' : ''}
-                </div>
-              </div>
-              {t.is_overdue && <Badge tone="danger">overdue</Badge>}
-              {total > 1 && (
-                <span className="shrink-0 text-xs tabular-nums text-ink-600">
-                  {done}/{total} done
+            <div key={g.key} className="rounded-xl bg-white/5">
+              <div className="flex items-center gap-3 px-4 py-3">
+                {/* A group of ONE has no person list to show, so clicking it must OPEN
+                    the thread — that is what every task did before fan-out existed, and
+                    every task created before today is still a group of one. Toggling
+                    `expanded` for those rendered nothing and made the thread unreachable. */}
+                <button onClick={() => g.ids.length > 1
+                          ? setExpanded(expanded === g.key ? null : g.key)
+                          : onOpen(g.sample)}
+                        className="min-w-0 flex-1 text-left">
+                  <div className="truncate text-sm font-semibold">{g.title}</div>
+                  <div className="mt-0.5 truncate text-xs text-ink-600">
+                    {g.ids.length > 1 ? `${g.ids.length} tasks` : `#${g.ids[0]}`} · {g.due}
+                    {g.hasDescription ? ' · has description' : ''}
+                    {g.ids.length > 1 && (expanded === g.key ? ' · hide people' : ' · show people')}
+                  </div>
+                </button>
+                {g.overdue && !allDone && <Badge tone="danger">overdue</Badge>}
+                <span className={cx('shrink-0 text-xs tabular-nums',
+                                    allDone ? 'text-emerald-300' : 'text-ink-600')}>
+                  {g.done}/{g.total} done
                 </span>
+                {!allDone && (
+                  <button onClick={() => void completeGroup(g)} disabled={busyKey === g.key}
+                          title={`Mark all ${g.total - g.done} remaining complete`}
+                          className="flex shrink-0 items-center gap-1.5 rounded-lg border
+                                     border-ink-600 px-2 py-1 text-xs font-medium transition
+                                     hover:bg-ink-700 disabled:opacity-40">
+                    {busyKey === g.key
+                      ? <Loader2 className="size-3.5 animate-spin" />
+                      : <CheckCircle2 className="size-3.5" />}
+                    Complete all
+                  </button>
+                )}
+              </div>
+
+              {/* One row per person, so a comment can be addressed to ONE of them.
+                  This is the point of fanning out: a comment on a single-assignee task
+                  is readable by that person, the owner and team leads — verified against
+                  _task_for_user — and by NOBODY else on the cohort. On a shared row the
+                  same comment goes to all 25. */}
+              {expanded === g.key && g.ids.length > 1 && (
+                <div className="space-y-1 border-t border-white/5 px-4 py-3">
+                  <div className="pb-1 text-[11px] text-ink-600">
+                    Open one person to comment privately — only they and the lead can read it.
+                  </div>
+                  {tasks
+                    .filter(t => g.ids.includes(t.id))
+                    .sort((a, b) => (a.assigned_to_name ?? '').localeCompare(b.assigned_to_name ?? ''))
+                    .map(t => (
+                      <button key={t.id} onClick={() => onOpen(t)}
+                              className="flex w-full items-center gap-3 rounded-lg px-2 py-1.5
+                                         text-left text-xs hover:bg-white/10">
+                        {t.status === 'completed'
+                          ? <CheckCircle2 className="size-3.5 shrink-0 text-emerald-300" />
+                          : <span className="size-3.5 shrink-0 rounded-full border border-ink-600" />}
+                        <span className="min-w-0 flex-1 truncate">
+                          {t.assigned_to_name ?? `user ${t.id}`}
+                        </span>
+                        <span className="shrink-0 text-ink-600">#{t.id}</span>
+                        <MessageSquare className="size-3.5 shrink-0 text-ink-600" />
+                      </button>
+                    ))}
+                </div>
               )}
-              <MessageSquare className="size-4 shrink-0 text-ink-600" />
-            </button>
+            </div>
           )
         })}
       </div>
@@ -269,13 +539,20 @@ function TaskList({ tasks, onOpen }: { tasks: Task[]; onOpen: (t: Task) => void 
 
 // ── Thread ──────────────────────────────────────────────────────────────────
 
-function Thread({ task, leadId, onBack }: {
-  task: Task; leadId: number; onBack: () => void
+function Thread({ task, leadId, members, onBack, onChanged }: {
+  task: Task; leadId: number; members: Member[]
+  onBack: () => void; onChanged: (t: Task) => void
 }) {
   const [comments, setComments] = useState<Comment[] | null>(null)
+  const [adding, setAdding] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [body, setBody] = useState('')
   const [busy, setBusy] = useState(false)
+  // Files uploaded but not yet linked to a comment (the backend's two-phase link:
+  // the row is written with comment_id NULL and re-parented when the comment posts).
+  const [staged, setStaged] = useState<TaskAttachment[]>([])
+  const [uploading, setUploading] = useState(0)
+  const fileRef = useRef<HTMLInputElement>(null)
 
   const load = useCallback(async () => {
     setError(null)
@@ -289,18 +566,87 @@ function Thread({ task, leadId, onBack }: {
 
   useEffect(() => { void load() }, [load])
 
+  /**
+   * A comment may be text, files, or both — the backend rejects only the case where
+   * it is neither. So a bare "here's the sheet" upload with no words is a legitimate
+   * comment and must not be blocked here.
+   */
   async function post() {
-    if (!body.trim()) return
+    if (!body.trim() && staged.length === 0) return
     setBusy(true)
     try {
-      await send(`/users/${leadId}/tasks/${task.id}/comments`, 'POST', { body: body.trim() })
+      await send(`/users/${leadId}/tasks/${task.id}/comments`, 'POST',
+                 { body: body.trim(), attachment_ids: staged.map(a => a.id) })
       setBody('')
+      setStaged([])
       await load()
     } catch (e) { setError((e as Error).message) } finally { setBusy(false) }
   }
 
+  /**
+   * Upload on pick, not on send. The file is in S3 and has a row before the lead has
+   * finished typing, so Send is instant — and an upload abandoned by navigating away
+   * just stays unlinked server-side rather than being lost mid-post.
+   *
+   * Uploaded AS THE LEAD, matching the thread read: the route re-checks task access
+   * with the same gate, so any other id would 404 on a task the lead owns.
+   *
+   * Files go up one at a time. The endpoint takes a single file, and a 25-file
+   * parallel burst against a free-tier service is a good way to turn one bad upload
+   * into fifteen; a rejected file also has to name ITSELF in the error, which a
+   * Promise.all would flatten away.
+   */
+  async function pick(files: FileList | null) {
+    if (!files || files.length === 0) return
+    setError(null)
+    for (const f of Array.from(files)) {
+      const ext = f.name.includes('.') ? f.name.split('.').pop()!.toLowerCase() : ''
+      // Checked here only to skip a pointless round trip — the server re-validates
+      // every one of these (extension, magic bytes, executable signatures) and its
+      // answer is the authoritative one.
+      if (!(ATTACH_EXTS as readonly string[]).includes(ext)) {
+        setError(`${f.name}: unsupported file type — allowed: ${ATTACH_EXTS.join(', ')}`)
+        continue
+      }
+      if (f.size > ATTACH_MAX_BYTES) {
+        setError(`${f.name}: too large (${prettyBytes(f.size)}); limit is ${prettyBytes(ATTACH_MAX_BYTES)}`)
+        continue
+      }
+      setUploading(n => n + 1)
+      try {
+        const a = await upload<TaskAttachment>(
+          `/users/${leadId}/tasks/${task.id}/attachments`, f)
+        setStaged(s => [...s, a])
+      } catch (e) { setError(`${f.name}: ${(e as Error).message}`) }
+      finally { setUploading(n => n - 1) }
+    }
+    // Same file twice in a row fires no change event unless the input is cleared.
+    if (fileRef.current) fileRef.current.value = ''
+  }
+
+  /** Drops the file from THIS comment only. The row and the S3 object stay — there is
+   *  no delete endpoint for an attachment, and an unlinked row is invisible in every
+   *  thread, so this is the honest extent of what "remove" can mean here. */
+  const unstage = (id: number) => setStaged(s => s.filter(a => a.id !== id))
+
   const total = task.assignee_count ?? 1
   const done = task.completed_count ?? 0
+  const roster = task.assignees ?? []
+  const assignedIds = new Set(roster.map(a => a.user_id))
+  // Team members not on this task yet. The lead is excluded: they are assigning, not
+  // doing, and adding them would hold the task open until they "completed" it too.
+  const missing = members.filter(m => m.user_id !== leadId && !assignedIds.has(m.user_id))
+
+  /** Add everyone on the team who is not already on the task. Uses the same
+   *  server-side expansion as creation, so it cannot miss a late joiner. */
+  async function addEveryone() {
+    setAdding(true)
+    try {
+      const r = await send<{ task: Task }>(`/items/${task.id}`, 'PATCH',
+                                          { user_id: leadId, assign_to_all_members: true })
+      if (r?.task) onChanged(r.task)
+    } catch (e) { setError((e as Error).message) } finally { setAdding(false) }
+  }
 
   return (
     <div className="space-y-6">
@@ -323,6 +669,50 @@ function Thread({ task, leadId, onBack }: {
             </div>
           )}
         </div>
+        {/* Assignees FIRST — who is on this and who has finished is the question this
+            page exists to answer; the description is reference material below it. */}
+        {roster.length > 0 && (
+          <div>
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs font-semibold uppercase tracking-wide text-ink-600">
+                Assigned to {task.assignees_truncated
+                  ? `(${total} people — list capped by the server)` : `(${total})`}
+              </span>
+              {missing.length > 0 && (
+                <button onClick={addEveryone} disabled={adding}
+                        className="flex items-center gap-1.5 rounded-lg bg-white/5 px-2.5 py-1
+                                   text-xs font-semibold hover:bg-white/10 disabled:opacity-50">
+                  {adding ? <Loader2 className="size-3.5 animate-spin" />
+                          : <UserPlus className="size-3.5" />}
+                  Add {missing.length} missing
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {[...roster]
+                // Done first, so progress reads at a glance.
+                .sort((a, b) => (a.status === b.status ? 0 : a.status === 'completed' ? -1 : 1))
+                .map(a => (
+                  <span key={a.user_id}
+                        title={a.completed_at ? `completed ${a.completed_at}` : 'not done yet'}
+                        className={cx('flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs',
+                          a.status === 'completed'
+                            ? 'bg-emerald-500/15 text-emerald-300'
+                            : 'bg-white/5 text-ink-400')}>
+                    {a.status === 'completed' && <CheckCircle2 className="size-3" />}
+                    {a.name ?? `user ${a.user_id}`}
+                  </span>
+                ))}
+            </div>
+            {missing.length > 0 && (
+              <p className="mt-2 text-xs text-amber-500/90">
+                {missing.length} team member{missing.length > 1 ? 's are' : ' is'} NOT on this
+                task: {missing.map(m => m.name).join(', ')}
+              </p>
+            )}
+          </div>
+        )}
+
         {task.description && (
           <pre className="whitespace-pre-wrap rounded-xl bg-black/30 p-3 text-sm text-ink-300">
 {task.description}
@@ -344,23 +734,107 @@ function Thread({ task, leadId, onBack }: {
                   <span className="font-semibold text-ink-300">{c.user_name ?? `user ${c.user_id}`}</span>
                   <span>{c.created_at}</span>
                 </div>
-                <div className="whitespace-pre-wrap text-sm">{c.body}</div>
+                {c.body && <div className="whitespace-pre-wrap text-sm">{c.body}</div>}
+                {c.attachments && c.attachments.length > 0 && (
+                  <div className={cx('flex flex-wrap gap-2', c.body && 'mt-2')}>
+                    {c.attachments.map(a => <Attachment key={a.id} a={a} userId={leadId} />)}
+                  </div>
+                )}
               </div>
             ))}
           </div>
         )}
 
+        {/* Staged files sit ABOVE the input, so what is about to be sent is visible
+            without hunting — a file already uploaded but not yet attached is the one
+            state where "did that work?" is a fair question. */}
+        {(staged.length > 0 || uploading > 0) && (
+          <div className="mt-4 flex flex-wrap gap-2">
+            {staged.map(a => (
+              <span key={a.id}
+                    className="flex items-center gap-2 rounded-lg bg-white/5 px-2.5 py-1.5 text-xs">
+                <FileText className="size-3.5 shrink-0 text-ink-400" />
+                <span className="max-w-[16rem] truncate">{a.file_name ?? `file ${a.id}`}</span>
+                <span className="tabular-nums text-ink-600">{prettyBytes(a.byte_size)}</span>
+                <button onClick={() => unstage(a.id)} title="Remove from this reply"
+                        className="text-ink-600 hover:text-rose-300">
+                  <X className="size-3.5" />
+                </button>
+              </span>
+            ))}
+            {uploading > 0 && (
+              <span className="flex items-center gap-2 rounded-lg bg-white/5 px-2.5 py-1.5 text-xs text-ink-400">
+                <Loader2 className="size-3.5 animate-spin" />
+                Uploading {uploading} file{uploading > 1 ? 's' : ''}…
+              </span>
+            )}
+          </div>
+        )}
+
         <div className="mt-5 flex gap-2">
-          <input className={inputCls} value={body} placeholder="Reply as the lead…"
+          <input ref={fileRef} type="file" multiple className="hidden"
+                 accept={ATTACH_EXTS.map(e => '.' + e).join(',')}
+                 onChange={e => void pick(e.target.files)} />
+          <button onClick={() => fileRef.current?.click()} disabled={busy}
+                  title={`Attach a file — ${ATTACH_EXTS.join(', ')}, up to ${prettyBytes(ATTACH_MAX_BYTES)}`}
+                  className="shrink-0 rounded-xl bg-white/5 px-3 py-2.5 text-ink-400
+                             hover:bg-white/10 hover:text-ink-200 disabled:opacity-50">
+            <Paperclip className="size-4" />
+          </button>
+          <input className={inputCls} value={body}
+                 placeholder={staged.length > 0 ? 'Add a message — optional' : 'Reply as the lead…'}
                  onChange={e => setBody(e.target.value)}
                  onKeyDown={e => { if (e.key === 'Enter') void post() }} />
-          <button onClick={post} disabled={busy || !body.trim()}
+          {/* Sendable on files alone: a file-only comment is valid server-side, and
+              disabling Send until something is typed would strand an uploaded file. */}
+          <button onClick={post} disabled={busy || uploading > 0 || (!body.trim() && staged.length === 0)}
                   className={cx('rounded-xl px-4 py-2.5 text-sm font-semibold',
-                    body.trim() ? 'bg-brand-500 text-white hover:bg-brand-600' : 'bg-white/5 text-ink-600')}>
+                    (body.trim() || staged.length > 0) && uploading === 0
+                      ? 'bg-brand-500 text-white hover:bg-brand-600' : 'bg-white/5 text-ink-600')}>
             {busy ? <Loader2 className="size-4 animate-spin" /> : 'Send'}
           </button>
         </div>
       </Card>
     </div>
+  )
+}
+
+// ── Attachment ──────────────────────────────────────────────────────────────
+
+/**
+ * One file on a comment. A preview is shown whenever the backend produced a
+ * thumbnail — which covers images AND the rendered first page of a PDF, the same
+ * field either way — and a labelled chip otherwise, because a Word or Excel file has
+ * no preview and a broken image frame is worse than an honest icon.
+ *
+ * Opens in a new tab rather than downloading: the relative route 302s to a
+ * short-lived signed URL, which a same-tab navigation would leave in history to rot.
+ */
+function Attachment({ a, userId }: { a: TaskAttachment; userId: number }) {
+  const href = attUrl(a, userId)
+  const thumb = attUrl(a, userId, true)
+  const name = a.file_name ?? `file ${a.id}`
+  const meta = [prettyBytes(a.byte_size), a.page_count ? `${a.page_count} pages` : null]
+    .filter(Boolean).join(' · ')
+
+  if (thumb) {
+    return (
+      <a href={href ?? undefined} target="_blank" rel="noreferrer" title={`${name} — ${meta}`}
+         className="group block overflow-hidden rounded-xl border border-ink-700/70 bg-black/30">
+        <img src={thumb} alt={name}
+             className="h-28 w-28 object-cover transition group-hover:opacity-80" />
+        <div className="max-w-[7rem] truncate px-2 py-1 text-[11px] text-ink-400">{name}</div>
+      </a>
+    )
+  }
+
+  return (
+    <a href={href ?? undefined} target="_blank" rel="noreferrer"
+       className="flex items-center gap-2 rounded-xl bg-white/5 px-3 py-2 text-xs
+                  hover:bg-white/10">
+      <FileText className="size-4 shrink-0 text-ink-400" />
+      <span className="max-w-[16rem] truncate font-medium">{name}</span>
+      <span className="tabular-nums text-ink-600">{meta}</span>
+    </a>
   )
 }
