@@ -104,6 +104,9 @@ export default function App() {
 // verifies against /admin/overview, which is what turns a stale secret into one clear
 // message instead of five identical 401s across five views.
 const ENV_ADMIN_SECRET = import.meta.env.VITE_ADMIN_SECRET as string | undefined
+// When the build declares its backend, the URL is not a question to put to whoever
+// opens the panel — it is configuration, and it is already answered.
+const ENV_ADMIN_BASE = import.meta.env.VITE_ADMIN_BASE as string | undefined
 
 function Login({ onDone }: { onDone: () => void }) {
   const [base, setBase] = useState(getBase() || DEFAULT_BASE)
@@ -131,9 +134,14 @@ function Login({ onDone }: { onDone: () => void }) {
     } catch (e) {
       clearCreds()
       if (e instanceof TypeError) {
-        setShowAdvanced(true)
-        setErr(`Cannot reach the backend. Check the URL below, and that ${location.origin} `
-               + 'is in CORS_ORIGINS.')
+        // With a build-configured backend the URL is not the suspect, so do not
+        // offer to edit it — say the one thing that is actually actionable.
+        if (!ENV_ADMIN_BASE) setShowAdvanced(true)
+        setErr(ENV_ADMIN_BASE
+          ? `Cannot reach ${ENV_ADMIN_BASE}. Add ${location.origin} to the backend's `
+            + 'CORS_ORIGINS, or the host is down.'
+          : `Cannot reach the backend. Check the URL below, and that ${location.origin} `
+            + 'is in CORS_ORIGINS.')
       } else {
         setErr((e as Error).message)
       }
@@ -159,7 +167,7 @@ function Login({ onDone }: { onDone: () => void }) {
               outside /admin/*, so the URL is the only thing between a stranger and
               /teams/{id}/members. It stays available to whoever is already inside
               (the toggle below), which is the only person who needs it. */}
-          {showAdvanced && (
+          {showAdvanced && !ENV_ADMIN_BASE && (
             <Field label="Backend URL">
               <input value={base} onChange={e => setBase(e.target.value)} className={inputCls}
                      placeholder="https://…onrender.com" spellCheck={false} />
@@ -178,7 +186,7 @@ function Login({ onDone }: { onDone: () => void }) {
                             text-xs leading-relaxed text-rose-200">{err}</div>
           )}
 
-          {!showAdvanced && (
+          {!showAdvanced && !ENV_ADMIN_BASE && (
             <button type="button" onClick={() => setShowAdvanced(true)}
                     className="text-xs text-ink-600 hover:text-ink-300">
               Use a different backend
