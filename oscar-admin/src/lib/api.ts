@@ -8,7 +8,26 @@
 const LS_URL = 'oscar.admin.baseUrl'
 const LS_SECRET = 'oscar.admin.secret'
 
-export const DEFAULT_BASE = 'https://developement-branch.onrender.com'
+// Running on localhost means a developer is working against their own backend, so
+// that is what the panel points at by default. It used to default to the deployed
+// service in every case, which had two bad consequences: the panel showed REAL
+// users' phone numbers and chat transcripts while someone was only trying to test
+// the UI, and a sleeping free-tier service answered the first request with an HTML
+// 502 page that surfaced as "SyntaxError: Unexpected token '<'" — an error that
+// says nothing about the actual cause.
+//
+// VITE_ADMIN_BASE overrides both, and the base URL typed on the login screen
+// (localStorage) still wins over everything — so pointing a local panel at the
+// deployed backend is one field, not a rebuild.
+const LOCAL_BASE = 'http://localhost:8000'
+const DEPLOYED_BASE = 'https://developement-branch.onrender.com'
+
+const _isLocalhost = typeof location !== 'undefined' &&
+  /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)
+
+export const DEFAULT_BASE =
+  (import.meta.env.VITE_ADMIN_BASE as string | undefined)?.replace(/\/+$/, '') ||
+  (_isLocalhost ? LOCAL_BASE : DEPLOYED_BASE)
 
 export const getBase = () => localStorage.getItem(LS_URL) || DEFAULT_BASE
 export const getSecret = () => localStorage.getItem(LS_SECRET) || ''
@@ -27,6 +46,32 @@ export class ApiError extends Error {
   constructor(status: number, message: string) {
     super(message)
     this.status = status
+  }
+}
+
+/**
+ * res.json() with a diagnosis instead of a parse error.
+ *
+ * A sleeping Render service, a proxy, or a tunnel can answer 200 with an HTML
+ * page. res.ok is true, so the old code went straight to res.json() and the user
+ * saw "SyntaxError: Unexpected token '<', \"<!doctype \"... is not valid JSON" —
+ * which names the symptom and hides the cause.
+ */
+async function parseJson<T>(res: Response, base: string): Promise<T> {
+  const text = await res.text()
+  try {
+    return JSON.parse(text) as T
+  } catch {
+    const looksHtml = /^\s*<(!doctype|html)/i.test(text)
+    throw new ApiError(
+      res.status,
+      looksHtml
+        ? `${base} returned an HTML page instead of JSON. The backend is ` +
+          `probably asleep or restarting (a free-tier service takes ~50s to ` +
+          `wake) \u2014 retry, or point the base URL at a backend that is up.`
+        : `${base} returned a response that is not JSON: ` +
+          `${text.slice(0, 120)}${text.length > 120 ? '\u2026' : ''}`,
+    )
   }
 }
 
@@ -62,7 +107,7 @@ export async function api<T>(path: string, signal?: AbortSignal): Promise<T> {
     } catch { /* non-JSON error body — keep the status line */ }
     throw new ApiError(res.status, detail)
   }
-  return res.json() as Promise<T>
+  return parseJson<T>(res, base)
 }
 
 /**
@@ -104,7 +149,7 @@ export async function send<T>(
     } catch { /* non-JSON error body — keep the status line */ }
     throw new ApiError(res.status, detail)
   }
-  return res.json() as Promise<T>
+  return parseJson<T>(res, base)
 }
 
 /** Attachment URLs come back RELATIVE, so they need the base prefixed to render. */
@@ -198,4 +243,38 @@ export type PushResult = {
 export type BusinessProfile = {
   business: string | null; note: string | null; details: string | null
   capabilities: string[]; getting_started: string[]
+}
+
+// ── Task tracking ───────────────────────────────────────────────────────────
+
+export type AdminTaskRow = {
+  id: number; title: string; status: string; priority: string | null
+  is_all_day: boolean; is_project: boolean
+  due_at: string | null; created_at: string | null; updated_at: string | null
+  completed_at: string | null; spilled_over_at: string | null
+  parent_task_id: number | null
+  owner_id: number; owner_name: string | null
+  assignee_id: number | null; assignee_name: string | null
+}
+
+export type AdminTeamRow = {
+  id: number; name: string; invite_code: string | null
+  owner_id: number | null; owner_name: string | null
+  members: number; tasks: number; project_tasks: number; meetings: number
+}
+
+export type AdminTaskDetail = {
+  task: Record<string, unknown>
+  assignees: { user_id: number; name: string | null; status: string; completed_at: string | null }[]
+  comments: { id: number; user_id: number; user_name: string | null; role: string; body: string; created_at: string | null }[]
+  timeline: { id: number; user_id: number | null; user_name: string | null; event_type: string; details: string | null; created_at: string | null }[]
+  attachments: { id: number; comment_id: number | null; file_name: string; mime_type: string; byte_size: number; created_at: string | null }[]
+  notifications: { id: number; user_id: number; type: string; message: string; is_read: number; created_at: string | null }[]
+}
+
+export type PresenceRow = {
+  id: number; name: string | null; email: string | null
+  account_type: string | null; last_seen: string | null
+  team_id: number | null; team_name: string | null; role: string | null
+  online: boolean
 }

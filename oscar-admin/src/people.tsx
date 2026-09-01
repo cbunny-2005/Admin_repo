@@ -17,9 +17,9 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Bell, Building2, Loader2, RotateCw, Search, ShieldCheck, UserPlus } from 'lucide-react'
+import { Bell, Building2, Clock, Loader2, RotateCw, Search, ShieldCheck, UserPlus, X } from 'lucide-react'
 import { api, send } from './lib/api'
-import type { BusinessProfile, McpRow, MemberRow, NotificationRow, PushResult, TeamRow } from './lib/api'
+import type { BusinessProfile, McpRow, MemberRow, NotificationRow, PresenceRow, PushResult, TeamRow } from './lib/api'
 import { Badge, Card, Empty, ErrorBox, Field, Spinner, Table, Td, cx, inputCls } from './ui'
 
 type Person = MemberRow & { team_id: number; team_name: string }
@@ -119,6 +119,7 @@ export function People() {
   const [q, setQ] = useState('')
   const [teamFilter, setTeamFilter] = useState<number | 'all'>('all')
   const [probes, setProbes] = useState<Record<number, Probe>>({})
+  const [recent, setRecent] = useState(false)
   const [profileFor, setProfileFor] = useState<TeamRow | null>(null)
   const [creating, setCreating] = useState(false)
 
@@ -258,6 +259,14 @@ export function People() {
         learn whether a device is reachable, because no endpoint returns device tokens.
       </p>
 
+      <div className="flex justify-end">
+        <button onClick={() => setRecent(true)}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-ink-700
+                           px-3 py-1.5 text-xs text-ink-300 hover:bg-ink-800/60 hover:text-white">
+          <Clock size={13} /> Who was here recently
+        </button>
+      </div>
+
       <Card>
         <Table head={['User', 'Team', 'Role', 'Presence', 'Unread', 'Push check', '']}>
           {shown.map(p => (
@@ -268,6 +277,8 @@ export function People() {
           <div className="py-14 text-center text-sm text-ink-500">No one matches that.</div>
         )}
       </Card>
+
+      {recent && <RecentPresence onClose={() => setRecent(false)} />}
 
       {profileFor && <OrgProfileEditor team={profileFor} onClose={() => setProfileFor(null)} />}
       {creating && (
@@ -706,5 +717,91 @@ function OrgProfileEditor({ team, onClose }: { team: TeamRow; onClose: () => voi
           )}
       </>
     </Modal>
+  )
+}
+
+/**
+ * Who had the app open most recently, newest first.
+ *
+ * Reads /admin/presence, which is ordered by last_seen and omits anyone who has
+ * never connected — a name with no time is what the per-row "—" already says, and
+ * repeating it here would bury the people who actually were here.
+ *
+ * `last_seen` is written on WS DISCONNECT, so it answers "when did they last have
+ * the app open", not "when did they log in" (nothing records logins). Someone
+ * connected right now therefore has a STALE last_seen by definition — which is
+ * why `online` comes from the live socket registry instead of the column.
+ */
+function RecentPresence({ onClose }: { onClose: () => void }) {
+  const [d, setD] = useState<{ count: number; online_now: number; rows: PresenceRow[] } | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+
+  useEffect(() => {
+    let live = true
+    api<{ count: number; online_now: number; rows: PresenceRow[] }>('/admin/presence?limit=100')
+      .then(r => { if (live) setD(r) })
+      .catch(e => { if (live) setErr((e as Error).message) })
+    return () => { live = false }
+  }, [])
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end bg-black/60" onClick={onClose}>
+      <div className="h-full w-full max-w-lg overflow-y-auto border-l border-ink-700 bg-ink-900 p-6"
+           onClick={e => e.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="text-sm font-semibold">Recent activity</div>
+            <div className="mt-1 text-xs text-ink-400">
+              Ordered by when each person&apos;s app connection last dropped. Anyone who has
+              never connected is not listed.
+            </div>
+          </div>
+          <button onClick={onClose} className="text-ink-400 hover:text-white"><X size={18} /></button>
+        </div>
+
+        {!d && !err && <div className="mt-6"><Spinner /></div>}
+        {err && <div className="mt-6"><ErrorBox error={err} /></div>}
+
+        {d && (
+          <>
+            <div className="mt-4 flex gap-2">
+              <Badge>{d.count} seen before</Badge>
+              <Badge tone={d.online_now ? 'on' : 'none'}>{d.online_now} online now</Badge>
+            </div>
+            <div className="mt-4 divide-y divide-ink-800">
+              {d.rows.map(r => (
+                <div key={r.id} className="flex items-baseline justify-between gap-3 py-2.5">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm">
+                      {r.name ?? `#${r.id}`}
+                      {r.online && (
+                        <span className="ml-2 inline-flex items-center gap-1 text-xs text-emerald-400">
+                          <span className="size-1.5 rounded-full bg-emerald-400" /> online
+                        </span>
+                      )}
+                    </div>
+                    <div className="truncate text-xs text-ink-500">
+                      {r.email ?? '—'}
+                      {r.team_name ? ` · ${r.team_name}` : ''}
+                    </div>
+                  </div>
+                  <div className="whitespace-nowrap text-right">
+                    <div className="text-xs text-ink-300">{ago(r.last_seen)}</div>
+                    <div className="font-mono text-[10px] text-ink-600">
+                      {r.last_seen ? new Date(r.last_seen).toLocaleString() : ''}
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {!d.rows.length && (
+                <div className="py-10 text-center text-sm text-ink-500">
+                  Nobody has connected yet.
+                </div>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
   )
 }
