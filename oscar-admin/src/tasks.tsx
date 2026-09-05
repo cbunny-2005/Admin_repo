@@ -43,30 +43,47 @@ export function Tasks() {
     '/admin/tasks' + applied)
 
   /**
-   * The chosen team's roster, so the user filter is a list of NAMES rather than an
-   * id typed from memory. Scoped to the team on purpose: "user id" was a free-text
-   * box whose only hint was "e.g. 48", and picking the wrong number returns an
-   * empty table that looks identical to a person with no tasks.
+   * The roster behind the Member filter, so it is a list of NAMES rather than an id
+   * typed from memory. "User id" was a free-text box whose only guidance was the
+   * placeholder "e.g. 48" — nothing on the page said which ids existed, and a wrong
+   * number returns an empty table that looks identical to a person with no tasks.
+   *
+   * ALWAYS POPULATED, not only once a team is chosen. Gating it on a team meant the
+   * control looked unchanged until you happened to pick one, so the feature was
+   * invisible — the filter now works from the moment the page loads, and choosing a
+   * team narrows it.
    *
    * GET /teams/{id}/members — no admin route lists a team's members (/admin/users
    * needs an email or a search string), and this one already backs People and the
-   * program console. It carries no email or username, which is exactly right here.
+   * program console. It carries no email or username, which is right for a filter.
    *
-   * Only fetched once a team is chosen. Across ALL teams the list would be ~58
-   * names with no way to tell two "Sriram"s apart, and the id is shown beside every
-   * name for that reason.
+   * With no team chosen every team is fetched and merged, deduped by user_id because
+   * the same person can appear in more than one roster. The team name rides along so
+   * the option can say which workspace someone is in — two distinct users are called
+   * "Sriram", so the id and the team are what tell them apart.
    */
-  const [members, setMembers] = useState<MemberRow[]>([])
+  const [members, setMembers] = useState<(MemberRow & { team_name?: string })[]>([])
   useEffect(() => {
-    if (!team) { setMembers([]); return }
     let live = true
-    api<MemberRow[]>(`/teams/${team}/members`)
-      .then(m => { if (live) setMembers(m) })
-      // A roster that fails to load must not break the page: the filter falls back
-      // to "any" and every other filter keeps working.
+    const wanted: { id: number; name: string }[] = team
+      ? [{ id: Number(team), name: '' }]
+      : (teams.data?.teams ?? []).map(t => ({ id: t.id, name: t.name }))
+    if (!wanted.length) { setMembers([]); return }
+
+    Promise.all(wanted.map(t =>
+      api<MemberRow[]>(`/teams/${t.id}/members`)
+        // One unreachable team must not empty the whole list.
+        .catch(() => [] as MemberRow[])
+        .then(ms => ms.map(m => ({ ...m, team_name: t.name })))))
+      .then(lists => {
+        if (!live) return
+        const byId = new Map<number, MemberRow & { team_name?: string }>()
+        for (const m of lists.flat()) if (!byId.has(m.user_id)) byId.set(m.user_id, m)
+        setMembers([...byId.values()].sort((a, b) => a.name.localeCompare(b.name)))
+      })
       .catch(() => { if (live) setMembers([]) })
     return () => { live = false }
-  }, [team])
+  }, [team, teams.data])
 
   const apply = () => {
     const p = new URLSearchParams()
@@ -117,24 +134,25 @@ export function Tasks() {
             </select>
           </label>
           <label className="text-xs text-ink-400">
-            {team ? 'Member' : 'User id'}
-            {/* A dropdown once a team is chosen, a plain id box otherwise — with no
-                team there is no roster to scope to, and 58 names across every team
-                is a worse control than the box it replaced. */}
-            {team ? (
-              <select value={user} onChange={e => setUser(e.target.value)}
-                      className={inputCls + ' mt-1 block'}>
-                <option value="">anyone</option>
-                {members.map(m => (
-                  <option key={m.user_id} value={m.user_id}>
-                    {m.name} · {m.user_id}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <input value={user} onChange={e => setUser(e.target.value)} placeholder="e.g. 48"
-                     className={inputCls + ' mt-1 block w-24'} />
-            )}
+            Member
+            {/* Always a select. The id is shown beside every name because two
+                distinct users are called "Sriram", and the team because the same
+                name can sit in two workspaces. */}
+            <select value={user} onChange={e => setUser(e.target.value)}
+                    className={inputCls + ' mt-1 block max-w-[260px]'}>
+              {/* The empty option doubles as the hint. With no team chosen this is
+                  everyone across all workspaces, so it says to narrow by team first
+                  — the guidance sits IN the control being used, rather than as a
+                  note beside it that is read after the mistake. */}
+              <option value="">
+                {team ? 'anyone on this team' : 'anyone — pick a team to narrow'}
+              </option>
+              {members.map(m => (
+                <option key={m.user_id} value={m.user_id}>
+                  {m.name} · {m.user_id}{m.team_name ? ` · ${m.team_name}` : ''}
+                </option>
+              ))}
+            </select>
           </label>
           <label className="text-xs text-ink-400">
             Status
