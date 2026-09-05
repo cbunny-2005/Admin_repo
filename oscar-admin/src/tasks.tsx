@@ -14,7 +14,7 @@ import { useEffect, useState } from 'react'
 import { ChevronRight, Search, X } from 'lucide-react'
 import { useApi } from './useApi'
 import { api } from './lib/api'
-import type { AdminTaskDetail, AdminTaskRow, AdminTeamRow } from './lib/api'
+import type { AdminTaskDetail, AdminTaskRow, AdminTeamRow, MemberRow } from './lib/api'
 import { Badge, Card, Empty, ErrorBox, Spinner, Stat, Table, Td, inputCls } from './ui'
 
 /** IST-naive wall clock — render the digits as stored, never through the
@@ -41,6 +41,32 @@ export function Tasks() {
   const teams = useApi<{ count: number; teams: AdminTeamRow[] }>('/admin/teams')
   const rows = useApi<{ count: number; truncated: boolean; tasks: AdminTaskRow[] }>(
     '/admin/tasks' + applied)
+
+  /**
+   * The chosen team's roster, so the user filter is a list of NAMES rather than an
+   * id typed from memory. Scoped to the team on purpose: "user id" was a free-text
+   * box whose only hint was "e.g. 48", and picking the wrong number returns an
+   * empty table that looks identical to a person with no tasks.
+   *
+   * GET /teams/{id}/members — no admin route lists a team's members (/admin/users
+   * needs an email or a search string), and this one already backs People and the
+   * program console. It carries no email or username, which is exactly right here.
+   *
+   * Only fetched once a team is chosen. Across ALL teams the list would be ~58
+   * names with no way to tell two "Sriram"s apart, and the id is shown beside every
+   * name for that reason.
+   */
+  const [members, setMembers] = useState<MemberRow[]>([])
+  useEffect(() => {
+    if (!team) { setMembers([]); return }
+    let live = true
+    api<MemberRow[]>(`/teams/${team}/members`)
+      .then(m => { if (live) setMembers(m) })
+      // A roster that fails to load must not break the page: the filter falls back
+      // to "any" and every other filter keeps working.
+      .catch(() => { if (live) setMembers([]) })
+    return () => { live = false }
+  }, [team])
 
   const apply = () => {
     const p = new URLSearchParams()
@@ -81,15 +107,34 @@ export function Tasks() {
         <div className="flex flex-wrap items-end gap-3">
           <label className="text-xs text-ink-400">
             Team
-            <select value={team} onChange={e => setTeam(e.target.value)} className={inputCls + ' mt-1 block'}>
+            {/* Changing the team CLEARS the user: a member of the old team is not
+                in the new one, so the pair would return an empty table that reads as
+                "no tasks" rather than "impossible filter". */}
+            <select value={team} onChange={e => { setTeam(e.target.value); setUser('') }}
+                    className={inputCls + ' mt-1 block'}>
               <option value="">any</option>
               {teams.data?.teams.map(t => <option key={t.id} value={t.id}>{t.id} · {t.name}</option>)}
             </select>
           </label>
           <label className="text-xs text-ink-400">
-            User id
-            <input value={user} onChange={e => setUser(e.target.value)} placeholder="e.g. 48"
-                   className={inputCls + ' mt-1 block w-24'} />
+            {team ? 'Member' : 'User id'}
+            {/* A dropdown once a team is chosen, a plain id box otherwise — with no
+                team there is no roster to scope to, and 58 names across every team
+                is a worse control than the box it replaced. */}
+            {team ? (
+              <select value={user} onChange={e => setUser(e.target.value)}
+                      className={inputCls + ' mt-1 block'}>
+                <option value="">anyone</option>
+                {members.map(m => (
+                  <option key={m.user_id} value={m.user_id}>
+                    {m.name} · {m.user_id}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input value={user} onChange={e => setUser(e.target.value)} placeholder="e.g. 48"
+                     className={inputCls + ' mt-1 block w-24'} />
+            )}
           </label>
           <label className="text-xs text-ink-400">
             Status
