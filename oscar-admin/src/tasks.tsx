@@ -239,7 +239,18 @@ export function Tasks() {
             Status
             <select value={status} onChange={e => setStatus(e.target.value)} className={inputCls + ' mt-1 block'}>
               <option value="">any</option>
-              {['pending', 'in_progress', 'completed', 'cancelled', 'blocked'].map(s =>
+              {/* THREE, not the column's five. `status` accepts
+                  pending/in_progress/completed/cancelled/blocked, but nothing in
+                  this product ever writes in_progress or blocked — measured on the
+                  whole table: 0 rows each. Offering them means two options that
+                  always return an empty table, which reads as a broken filter
+                  rather than as a true "none exist".
+
+                  🔴 The dropdown is the only thing narrowed. `sortRows` still ranks
+                  all five, and the backend is untouched, so a row written by some
+                  other client still sorts and displays correctly — it just cannot
+                  be picked here until it exists. Re-add the word when it does. */}
+              {['pending', 'completed', 'cancelled'].map(s =>
                 <option key={s} value={s}>{s}</option>)}
             </select>
           </label>
