@@ -131,6 +131,57 @@ export function Tasks() {
     setApplied('?limit=200')
   }
 
+  /**
+   * Client-side sort over the rows already fetched. /admin/tasks has no sort
+   * parameter, and the page caps at 200 rows anyway — sorting server-side would
+   * mean re-fetching to reorder something already on screen.
+   *
+   * ⚠️ It therefore orders THE PAGE, not the table: with `truncated` set you are
+   * sorting the first 200 rows the backend chose, not the 1,300 that match. The
+   * banner above already says so, which is why this is honest rather than
+   * misleading — but narrow the filters before reading a sorted list as a ranking.
+   */
+  const [sort, setSort] = useState<string | null>(null)
+  const [dir, setDir] = useState<'asc' | 'desc'>('asc')
+  const onSort = (key: string) => {
+    if (sort === key) { setDir(d => (d === 'asc' ? 'desc' : 'asc')); return }
+    setSort(key); setDir('asc')
+  }
+
+  // 🔴 Status sorts by LIFECYCLE, not alphabetically. A-Z puts cancelled first and
+  // pending last, which is precisely backwards from how anyone reads a task board:
+  // the live work belongs at the top and the closed work at the bottom.
+  const STATUS_ORDER: Record<string, number> = {
+    pending: 0, in_progress: 1, blocked: 2, completed: 3, cancelled: 4,
+  }
+  // Same reasoning: critical outranks normal, and a null priority reads as normal.
+  const PRIORITY_ORDER: Record<string, number> = { critical: 0, normal: 1 }
+
+  const sortRows = (list: AdminTaskRow[]) => {
+    if (!sort) return list
+    const rank = (t: AdminTaskRow): string | number => {
+      switch (sort) {
+        case 'status': return STATUS_ORDER[t.status] ?? 99
+        case 'priority': return PRIORITY_ORDER[t.priority ?? 'normal'] ?? 99
+        // Nulls last in BOTH directions — a task with no due date is not "earliest",
+        // it is unscheduled, and letting it lead an ascending sort buries the rows
+        // the sort was asked for.
+        case 'due_at': return t.due_at ?? '\uffff'
+        case 'id': return t.id
+        case 'title': return t.title.toLowerCase()
+        case 'owner': return (t.owner_name ?? '').toLowerCase()
+        case 'assignee': return (t.assignee_name ?? '\uffff').toLowerCase()
+        default: return 0
+      }
+    }
+    // A copy: sort() mutates, and this array belongs to the fetch hook's state.
+    return [...list].sort((a, b) => {
+      const x = rank(a), y = rank(b)
+      const c = x < y ? -1 : x > y ? 1 : 0
+      return dir === 'asc' ? c : -c
+    })
+  }
+
   return (
     <div className="space-y-4">
       {/* Teams first: an empty project_tasks count is the condition that got the
@@ -230,8 +281,17 @@ export function Tasks() {
               Showing the first {rows.data.count} — narrow the filters to see the rest.
             </div>
           )}
-          <Table head={['#', 'Title', 'Status', 'Priority', 'Due', 'Owner', 'Assignee', 'Board', '']}>
-            {rows.data.tasks.map(t => (
+          <Table sort={sort} dir={dir} onSort={onSort}
+                 head={[
+                   { label: '#', sort: 'id' },
+                   { label: 'Title', sort: 'title' },
+                   { label: 'Status', sort: 'status' },
+                   { label: 'Priority', sort: 'priority' },
+                   { label: 'Due', sort: 'due_at' },
+                   { label: 'Owner', sort: 'owner' },
+                   { label: 'Assignee', sort: 'assignee' },
+                   'Board', '']}>
+            {sortRows(rows.data.tasks).map(t => (
               <tr key={t.id} className="hover:bg-ink-800/40 transition">
                 <Td className="font-mono text-xs text-ink-400">{t.id}</Td>
                 <Td className="text-sm max-w-[320px] truncate" >{t.title}</Td>
