@@ -26,6 +26,34 @@ const wall = (s: string | null) => (s ? s.replace('T', ' ').slice(0, 16) : null)
 // key — the entries were added to ui.tsx rather than mapped to a second vocabulary
 // here, which would have meant two names for one state.
 
+/**
+ * Today in IST as YYYY-MM-DD.
+ *
+ * 🔴 NOT `toISOString().slice(0,10)`, which is UTC — before 5:30 AM IST that returns
+ * YESTERDAY, so a "Today" preset would quietly show the wrong day every morning.
+ * The backend filters `due_at` on the IST wall-clock the user chose, so the preset
+ * has to be built in the same zone.
+ */
+const istToday = () =>
+  new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date())
+
+/** A date `n` days from today, in IST. Negative goes back. */
+const istShift = (n: number) => {
+  const d = new Date(`${istToday()}T00:00:00`)
+  d.setDate(d.getDate() + n)
+  return new Intl.DateTimeFormat('en-CA').format(d)
+}
+
+/** The quick ranges, as [from, to]. An empty string means unbounded on that side. */
+const DATE_PRESETS: { label: string; range: () => [string, string] }[] = [
+  { label: 'Today', range: () => [istToday(), istToday()] },
+  { label: 'Tomorrow', range: () => [istShift(1), istShift(1)] },
+  { label: 'This week', range: () => [istToday(), istShift(6)] },
+  // Overdue is everything BEFORE today with no lower bound — the point is the long
+  // tail, and a start date would hide exactly the oldest rows worth seeing.
+  { label: 'Overdue', range: () => ['', istShift(-1)] },
+]
+
 export function Tasks() {
   const [team, setTeam] = useState('')
   const [user, setUser] = useState('')
@@ -254,6 +282,27 @@ export function Tasks() {
                 <option key={s} value={s}>{s}</option>)}
             </select>
           </label>
+          {/* Quick ranges. They set the same two date inputs rather than a separate
+              mode, so what a preset did stays visible and editable — a preset that
+              hid its own dates would make "why these rows?" unanswerable. */}
+          <div className="text-xs text-ink-400">
+            Quick range
+            <div className="mt-1 flex gap-1">
+              {DATE_PRESETS.map(p => {
+                const [f, t] = p.range()
+                const on = from === f && to === t
+                return (
+                  <button key={p.label} type="button"
+                          onClick={() => { setFrom(f); setTo(t) }}
+                          className={'rounded-lg border px-2.5 py-2 text-xs transition ' +
+                            (on ? 'border-brand-500/60 bg-brand-500/15 text-brand-200'
+                                : 'border-ink-700 text-ink-300 hover:bg-ink-800/60')}>
+                    {p.label}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
           <label className="text-xs text-ink-400">
             Due from
             <input type="date" value={from} onChange={e => setFrom(e.target.value)}
@@ -287,11 +336,22 @@ export function Tasks() {
       {rows.error && <ErrorBox error={rows.error} onRetry={rows.reload} />}
       {rows.data && (
         <Card className="overflow-hidden rise">
-          {rows.data.truncated && (
-            <div className="border-b border-amber-500/20 bg-amber-500/10 px-4 py-2 text-xs text-amber-300">
-              Showing the first {rows.data.count} — narrow the filters to see the rest.
-            </div>
-          )}
+          {/* The count, always — not only when truncated. "How many match?" is the
+              question most of these filters are asked in order to answer, and it
+              was previously only stated in the failure case, so a filter returning
+              47 rows made you count them yourself.
+
+              🔴 `count` is the number of rows RETURNED, not the number that match:
+              /admin/tasks has no total, and at the cap the two differ. So the
+              truncated wording never claims to be a total — it says "the first
+              200", and only the un-truncated line calls the number a match count. */}
+          <div className={'border-b px-4 py-2 text-xs ' + (rows.data.truncated
+            ? 'border-amber-500/20 bg-amber-500/10 text-amber-300'
+            : 'border-ink-700/70 text-ink-400')}>
+            {rows.data.truncated
+              ? `Showing the first ${rows.data.count} — narrow the filters to see the rest.`
+              : `${rows.data.count} task${rows.data.count === 1 ? '' : 's'} match.`}
+          </div>
           <Table sort={sort} dir={dir} onSort={onSort}
                  head={[
                    { label: '#', sort: 'id' },
