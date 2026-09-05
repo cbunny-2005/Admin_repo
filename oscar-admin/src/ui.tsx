@@ -70,18 +70,55 @@ export function Badge({ children, tone }: { children: ReactNode; tone?: string }
 /** Muted em-dash for null. A blank cell reads as "not loaded"; this reads as "empty". */
 export const Empty = () => <span className="text-ink-600">—</span>
 
-export function Table({ head, children }: { head: string[]; children: ReactNode }) {
+/** A sortable column: the label plus the key it sorts by. A plain string stays a
+ *  plain header, so a table that does not sort needs no change. */
+export type Col = string | { label: string; sort: string }
+
+const colLabel = (c: Col) => (typeof c === 'string' ? c : c.label)
+const colSort = (c: Col) => (typeof c === 'string' ? null : c.sort)
+
+export function Table({ head, children, sort, dir, onSort }: {
+  head: Col[]
+  children: ReactNode
+  /** The key currently sorted by, or null. */
+  sort?: string | null
+  dir?: 'asc' | 'desc'
+  /** Given a column's key. Omit it and every header stays inert. */
+  onSort?: (key: string) => void
+}) {
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-ink-700/70">
-            {head.map(h => (
-              <th key={h} className="px-4 py-3 text-left text-[11px] font-semibold
-                                     uppercase tracking-[.12em] text-ink-400 whitespace-nowrap">
-                {h}
-              </th>
-            ))}
+            {head.map(h => {
+              const key = colSort(h)
+              const on = !!key && !!onSort
+              const active = on && sort === key
+              return (
+                <th key={colLabel(h)}
+                    // A sortable header is a real button, not a th with onClick:
+                    // it has to be reachable by keyboard and announce itself, and
+                    // aria-sort is what a screen reader reads to say which column
+                    // the order comes from.
+                    aria-sort={active ? (dir === 'asc' ? 'ascending' : 'descending') : undefined}
+                    className={'px-4 py-3 text-left text-[11px] font-semibold ' +
+                               'uppercase tracking-[.12em] whitespace-nowrap ' +
+                               (active ? 'text-ink-200' : 'text-ink-400')}>
+                  {on ? (
+                    <button type="button" onClick={() => onSort!(key!)}
+                            className="inline-flex items-center gap-1 uppercase tracking-[.12em]
+                                       hover:text-ink-200 transition">
+                      {colLabel(h)}
+                      {/* The arrow shows only on the active column. An idle marker on
+                          every sortable header reads as "already sorted by all of
+                          these", which is the opposite of what it means. */}
+                      {active && <span aria-hidden>{dir === 'asc' ? '\u2191' : '\u2193'}</span>}
+                    </button>
+                  ) : colLabel(h)}
+                </th>
+              )
+            })}
           </tr>
         </thead>
         <tbody className="divide-y divide-ink-700/40">{children}</tbody>
