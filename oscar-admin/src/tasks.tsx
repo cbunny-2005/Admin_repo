@@ -10,7 +10,7 @@
  * Read-only. Nothing on this page writes.
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ChevronRight, Search, X } from 'lucide-react'
 import { useApi } from './useApi'
 import { api } from './lib/api'
@@ -85,19 +85,49 @@ export function Tasks() {
     return () => { live = false }
   }, [team, teams.data])
 
-  const apply = () => {
+  /** The query the CURRENT inputs describe. Built in one place so the auto-apply
+   *  below and the Apply button can never disagree about what a filter means. */
+  const queryFor = (search: string) => {
     const p = new URLSearchParams()
     if (team) p.set('team_id', team)
     if (user) p.set('user_id', user)
     if (status) p.set('status', status)
     if (from) p.set('date_from', from)
     if (to) p.set('date_to', to)
-    if (q.trim()) p.set('q', q.trim())
+    if (search.trim()) p.set('q', search.trim())
     p.set('limit', '200')
-    setApplied('?' + p.toString())
+    return '?' + p.toString()
   }
+
+  const apply = () => setApplied(queryFor(q))
+
+  /**
+   * Picking a team, a member, a status or a date applies IMMEDIATELY — those are
+   * discrete choices, so one click is one intent and making someone then find
+   * Apply is a second step with nothing to decide in between.
+   *
+   * 🔴 The text search is deliberately NOT in this dependency list. It changes on
+   * every keystroke, and firing a request per character against a table this size
+   * is what the Apply button existed to prevent — so typing still waits for Apply
+   * or Enter. `q` is read through a ref rather than closed over, because including
+   * it in the deps is exactly the thing being avoided.
+   */
+  const qRef = useRef(q)
+  qRef.current = q
+  const firstRun = useRef(true)
+  useEffect(() => {
+    // Skip the mount: the page already loads with '?limit=200' and re-requesting
+    // the same thing on arrival is a wasted round trip against 1,300 rows.
+    if (firstRun.current) { firstRun.current = false; return }
+    setApplied(queryFor(qRef.current))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [team, user, status, from, to])
   const clear = () => {
     setTeam(''); setUser(''); setStatus(''); setFrom(''); setTo(''); setQ('')
+    // Set explicitly rather than left to the auto-apply effect: React batches these
+    // into one render so the effect would fire once and reach the same query, but
+    // only because `q` is cleared in the same batch. Stating it here means Clear
+    // does not depend on that reasoning holding.
     setApplied('?limit=200')
   }
 
@@ -178,9 +208,12 @@ export function Tasks() {
                    onKeyDown={e => e.key === 'Enter' && apply()}
                    placeholder="search…" className={inputCls + ' mt-1 block w-full'} />
           </label>
+          {/* "Search", not "Apply": the dropdowns and dates now apply themselves, so
+              the only thing left for a button is the text box beside it — and a
+              button still labelled Apply would imply the filters were waiting on it. */}
           <button onClick={apply}
                   className="rounded-lg bg-brand-500/90 px-4 py-2 text-sm font-medium text-white hover:bg-brand-500">
-            <Search size={14} className="inline -mt-px mr-1" />Apply
+            <Search size={14} className="inline -mt-px mr-1" />Search
           </button>
           <button onClick={clear} className="rounded-lg border border-ink-700 px-3 py-2 text-sm text-ink-300 hover:bg-ink-800/60">
             <X size={14} className="inline -mt-px mr-1" />Clear
