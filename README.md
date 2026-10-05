@@ -2,6 +2,15 @@
 
 Operations panel for the HelloOscar backend. React + Vite + Tailwind v4.
 
+> **Repo mirrors, updated 2026-10-05.** This repo pushes to TWO remotes: `origin`
+> (`cbunny-2005/Admin_repo`, original) and `alumnx`
+> (`alumnxcodebase/hello_oscar_admin_dashboard`, added 2026-10-05). Only
+> `Brand_new_admin_after_revamp` has been pushed to `alumnx` so far, as its `main`
+> branch — the other three local branches (`feat/program-console`, `feat/sarvam-voice`,
+> local `main`) are **not yet on `alumnx`**. `Brand_new_admin_after_revamp` is the
+> correct one to deploy from (see "Deploying it" below) and fully contains the other
+> two feature branches' work already.
+
 > **Updated 2026-10-02.** Rewritten against this repo's actual `git log` and current
 > `oscar-admin/src` — the previous version of this file described an earlier, fully
 > read-only, port-5173 panel that no longer exists on this branch. See "What changed"
