@@ -1,32 +1,58 @@
-# React + TypeScript + Vite
+# oscar-admin
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+> **Replaced 2026-10-02.** This file was still the unedited Vite/React template
+> boilerplate (React Compiler, Oxlint setup notes) and described nothing about this
+> actual app. **See `/README.md` at the repo root for the real, current docs** —
+> what this panel does, which tabs write, the port-5174 CORS requirement, the
+> backend-URL precedence fix, and the `epa-3` role-change warning. This file now only
+> covers things specific to running `oscar-admin/` as a Vite project.
 
-Currently, two official plugins are available:
+## Stack
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+React 19 + TypeScript + Vite, Tailwind v4 (`@tailwindcss/vite`), Oxlint.
 
-## React Compiler
+## Commands
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm install
+npm run dev      # http://localhost:5174 — see root README for why 5174, not 5173
+npm run build    # -> dist/
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## Config files relevant here
+
+- `vite.config.ts` — `port: 5174` with `strictPort: true` (fails loudly on a clash
+  rather than silently picking another port that the backend's `CORS_ORIGINS` doesn't
+  know about); `base` defaults to `/` for Vercel, overridable via `BASE_PATH` env for a
+  subpath host.
+- `.env.local` (gitignored, not committed) — holds `VITE_ADMIN_BASE`,
+  `VITE_ADMIN_SECRET`, and programme/voice-spike-specific vars. See the file itself
+  for what each one does; it is commented in place.
+- `src/lib/api.ts` — the backend client. `getBase()`'s precedence
+  (`VITE_ADMIN_BASE` → `localStorage` → same-origin default) is the fix described in
+  the root README; do not reorder it without reading that section first.
+
+## Source layout
+
+```
+src/
+  App.tsx       # tab nav (NAV array), login gate
+  views.tsx     # Overview, Sessions, Mcp
+  people.tsx    # People tab (writes: push test, org profile)
+  program.tsx   # Alumnx AI Engineer Program console (writes: tasks, comments)
+  tasks.tsx     # Tasks tab (read-only, /admin/tasks)
+  lib/api.ts    # backend client, getBase()/getSecret()/setCreds()
+  lib/liveVoice.ts, realtime.ts, sarvam.ts   # voice-spike leftovers. Confirmed
+                                              # (2026-10-02, grep over src/) not
+                                              # imported by App.tsx or any NAV view —
+                                              # dead code since the Voice tabs were
+                                              # removed in 06ea91c (2026-09-01, see
+                                              # root README). Safe to delete; left in
+                                              # place here only because this pass was
+                                              # docs-only.
+```
+
+## Linting
+
+Oxlint is configured (`.oxlintrc.json`). For type-aware rules, install
+`oxlint-tsgolint` per the Oxlint docs — not evaluated as part of this pass.
